@@ -1,0 +1,37 @@
+{
+  "filename": "raw_20260805_153719_635.png",
+  "resolution": {
+    "width": 720,
+    "height": 1600
+  },
+  "screen_state_tag": "HOME_SCREEN",
+  "objects": [
+    {
+      "label": "app_icon_instagram",
+      "bbox": [
+        438,
+        111,
+        544,
+        209
+      ]
+    },
+    {
+      "label": "app_icon_camera",
+      "bbox": [
+        177,
+        518,
+        277,
+        623
+      ]
+    },
+    {
+      "label": "app_icon_clock",
+      "bbox": [
+        443,
+        314,
+        537,
+        413
+      ]
+    }
+  ]
+}
