@@ -1,0 +1,28 @@
+{
+  "filename": "raw_20260805_153749_984.png",
+  "resolution": {
+    "width": 720,
+    "height": 1600
+  },
+  "screen_state_tag": "HOME_SCREEN",
+  "objects": [
+    {
+      "label": "app_icon_clock",
+      "bbox": [
+        181,
+        1150,
+        278,
+        1254
+      ]
+    },
+    {
+      "label": "app_icon_camera",
+      "bbox": [
+        440,
+        921,
+        540,
+        1026
+      ]
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+# Core ML
+torch
+torchvision
+
+# Image processing
+opencv-python
+Pillow
+numpy
+
+# Visualization
+matplotlib
+
+# API & config
+requests
+python-dotenv

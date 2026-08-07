@@ -1,0 +1,124 @@
+# ==============================================================================
+# LYRA Project - .gitignore Configuration
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Environment & Secret Configurations
+# ------------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# ------------------------------------------------------------------------------
+# 2. Virtual Environments & Packages
+# ------------------------------------------------------------------------------
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+UI_Labeling/venv/
+
+# ------------------------------------------------------------------------------
+# 3. Python Bytecode, Caches & Build Artifacts
+# ------------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ------------------------------------------------------------------------------
+# 4. Testing, Coverage & Type Checker Caches
+# ------------------------------------------------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.noserc
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+# ------------------------------------------------------------------------------
+# 5. IDE & OS Generated Files
+# ------------------------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# ------------------------------------------------------------------------------
+# 6. Temporary Files, Logs & Scratch Workspace
+# ------------------------------------------------------------------------------
+*.log
+logs/*
+!logs/.gitkeep
+scratch/*
+!scratch/.gitkeep
+temp/
+tmp/
+cache/
+.cache/
+data/temp/*
+!data/temp/.gitkeep
+
+# ------------------------------------------------------------------------------
+# 7. Model Checkpoints & Evaluation Results
+# ------------------------------------------------------------------------------
+checkpoints/*
+!checkpoints/.gitkeep
+results/*
+!results/.gitkeep
+*.pt
+*.pth
+*.onnx
+*.bin
+*.safetensors
+
+# ------------------------------------------------------------------------------
+# 8. Large Dataset Binaries & Visualizations (Folder structure kept via .gitkeep)
+# ------------------------------------------------------------------------------
+data/raw_screenshots/*
+!data/raw_screenshots/.gitkeep
+
+data/processed/*
+!data/processed/.gitkeep
+!data/processed/**/.gitkeep
+
+data/failures/*
+!data/failures/.gitkeep
+
+data/visualized_annotations/*
+!data/visualized_annotations/.gitkeep

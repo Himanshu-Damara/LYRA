@@ -1,0 +1,55 @@
+{
+  "filename": "raw_20260805_155116_851.png",
+  "resolution": {
+    "width": 720,
+    "height": 1600
+  },
+  "screen_state_tag": "INSTAGRAM_HOME",
+  "objects": [
+    {
+      "label": "story_thumbnail",
+      "bbox": [
+        401,
+        65,
+        573,
+        189
+      ]
+    },
+    {
+      "label": "story_thumbnail",
+      "bbox": [
+        594,
+        64,
+        720,
+        188
+      ]
+    },
+    {
+      "label": "post_like_liked",
+      "bbox": [
+        23,
+        1355,
+        90,
+        1405
+      ]
+    },
+    {
+      "label": "story_thumbnail",
+      "bbox": [
+        11,
+        64,
+        183,
+        188
+      ]
+    },
+    {
+      "label": "story_thumbnail",
+      "bbox": [
+        206,
+        63,
+        377,
+        187
+      ]
+    }
+  ]
+}

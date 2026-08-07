@@ -1,0 +1,46 @@
+{
+  "filename": "raw_20260805_154945_510.png",
+  "resolution": {
+    "width": 720,
+    "height": 1600
+  },
+  "screen_state_tag": "INSTAGRAM_HOME",
+  "objects": [
+    {
+      "label": "story_thumbnail",
+      "bbox": [
+        207,
+        63,
+        380,
+        240
+      ]
+    },
+    {
+      "label": "story_thumbnail",
+      "bbox": [
+        403,
+        63,
+        576,
+        240
+      ]
+    },
+    {
+      "label": "story_thumbnail",
+      "bbox": [
+        592,
+        60,
+        720,
+        237
+      ]
+    },
+    {
+      "label": "post_like_unliked",
+      "bbox": [
+        27,
+        1312,
+        87,
+        1360
+      ]
+    }
+  ]
+}
