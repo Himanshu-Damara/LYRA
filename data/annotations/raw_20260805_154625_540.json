@@ -1,0 +1,19 @@
+{
+  "filename": "raw_20260805_154625_540.png",
+  "resolution": {
+    "width": 720,
+    "height": 1600
+  },
+  "screen_state_tag": "INSTAGRAM_HOME",
+  "objects": [
+    {
+      "label": "post_like_unliked",
+      "bbox": [
+        21,
+        1356,
+        91,
+        1411
+      ]
+    }
+  ]
+}

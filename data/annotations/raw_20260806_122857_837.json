@@ -1,0 +1,19 @@
+{
+  "filename": "raw_20260806_122857_837.png",
+  "resolution": {
+    "width": 720,
+    "height": 1600
+  },
+  "screen_state_tag": "CAMERA_VIEWFINDER",
+  "objects": [
+    {
+      "label": "shutter_button",
+      "bbox": [
+        286,
+        1283,
+        426,
+        1415
+      ]
+    }
+  ]
+}
