@@ -1,0 +1,12 @@
+search_button:
+  content_desc: "Search"
+  resource_id: "com.whatsapp:id/menuitem_search"
+search_input:
+  resource_id: "com.whatsapp:id/search_input"
+contact_row:
+  resource_id: "com.whatsapp:id/contact_row_container"
+message_input:
+  resource_id: "com.whatsapp:id/entry"
+send_button:
+  content_desc: "Send"
+  resource_id: "com.whatsapp:id/send"
