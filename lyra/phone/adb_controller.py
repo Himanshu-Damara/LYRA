@@ -34,10 +34,14 @@ class ADBController:
         """Executes an `adb shell` command."""
         cmd = [self.adb_path, "shell"] + list(args)
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            res = subprocess.run(cmd, capture_output=True, text=True, check=True, encoding='utf-8', errors='replace')
             return res.stdout.strip()
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"ADB shell command failed ({cmd}): {e.stderr.strip()}") from e
+
+    def shell(self, *args: str) -> str:
+        """Executes an `adb shell` command."""
+        return self._run_adb_shell(*args)
 
     def tap(self, x: int, y: int) -> None:
         """

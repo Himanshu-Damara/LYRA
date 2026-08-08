@@ -1,0 +1,6 @@
+# Optional desktop voice input/output dependencies.
+speechrecognition
+pyttsx3
+# PyAudio may require Microsoft C++ Build Tools on Windows.
+# Install it separately only if microphone input is needed:
+# pip install pyaudio

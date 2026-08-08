@@ -1,65 +1,69 @@
-# ==============================================================================
-# LYRA Project - Minimal .gitignore
-# ==============================================================================
-
-# ------------------------------------------------------------------------------
-# 1. Secrets
-# ------------------------------------------------------------------------------
+# Environment & secrets
 .env
-.env.*
-!.env.example
-
-# ------------------------------------------------------------------------------
-# 2. Python Virtual Environments
-# ------------------------------------------------------------------------------
-venv/
 .venv/
-env/
-ENV/
-UI_Labeling/venv/
+venv/
+gcm-diagnose.log
+.git_bak/
+**/.git_bak/
 
-# ------------------------------------------------------------------------------
-# 3. Python Cache
-# ------------------------------------------------------------------------------
+# Virtual environments (anywhere in the project)
+**/venv/
+**/env/
+
+# Cloned third-party repos (large, not for version control)
+UI_Labeling/groundingdino_repo/
+UI_Labeling/omniparser_repo/
+UI_Labeling/sam2/
+
+# Node modules (anywhere in the project)
+**/node_modules/
+
+# Android agent ignores
+android-agent/**/*.db
+android-agent/**/*.db-wal
+android-agent/**/*.db-shm
+android-agent/data/
+android-agent/test_recordings/
+android-agent/reference/
+android-agent/.claude/
+android-agent/site/dist/
+android-agent/site/.astro/
+android-agent/portal/.gradle/
+android-agent/portal/app/build/
+android-agent/portal/build/
+android-agent/portal/local.properties
+android-agent/portal/*.apk
+android-agent/docs/HUMAN/
+android-agent/scripts/privacy/FORBIDDEN.local.txt
+android-agent/.recordings/
+
+# Data directories (large files, not for version control)
+data/
+
+# Model checkpoints
+checkpoints/
+
+# Training logs
+logs/
+
+# Evaluation results
+results/
+
+# Python
 __pycache__/
-*.py[cod]
-*$py.class
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
 
-# ------------------------------------------------------------------------------
-# 4. Test & Build Cache
-# ------------------------------------------------------------------------------
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-
-# ------------------------------------------------------------------------------
-# 5. IDE Files
-# ------------------------------------------------------------------------------
+# IDE
 .vscode/
 .idea/
+*.swp
+*.swo
 
-# ------------------------------------------------------------------------------
-# 6. OS Files
-# ------------------------------------------------------------------------------
-.DS_Store
+# OS
 Thumbs.db
-Desktop.ini
-
-# ------------------------------------------------------------------------------
-# 7. Temporary Files
-# ------------------------------------------------------------------------------
-*.log
-.cache/
-temp/
-tmp/
-
-# ------------------------------------------------------------------------------
-# 8. Trained Models (Very Large)
-# ------------------------------------------------------------------------------
-*.pt
-*.pth
-*.onnx
-*.bin
-*.safetensors
+.DS_Store

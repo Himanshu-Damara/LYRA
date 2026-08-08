@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LYRA — Humanized AI Voice & Phone Assistant</title>
+  <meta name="description" content="LYRA Autonomous AI Phone Assistant & Voice Agent Dashboard powered by Vision Model and Grok API">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- Top Navbar -->
+  <header class="navbar">
+    <div class="brand">
+      <div class="brand-logo">L</div>
+      <h1 class="brand-title">LYRA AI Assistant</h1>
+    </div>
+
+    <div class="nav-actions">
+      <div class="device-status-badge">
+        <div class="status-dot"></div>
+        <span id="deviceStatusText">Checking phone connection...</span>
+      </div>
+
+      <button class="theme-toggle-btn" id="themeToggleBtn" onclick="toggleTheme()" title="Toggle Light/Dark Theme">
+        <span class="theme-toggle-icon" id="themeIcon">🌙</span>
+        <span id="themeLabel">Dark Mode</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- Main Dashboard Container -->
+  <main class="container">
+    
+    <!-- Left Column: Interactive Live Phone Screen Mirror & Vision Canvas -->
+    <section class="phone-container">
+      <div class="glass-card" style="width: 100%;">
+        <div class="card-header">
+          <h2 class="card-title">📱 Interactive Screen Vision</h2>
+          <button onclick="launchScrcpyMirror()" class="action-btn" style="padding: 6px 12px; font-size: 11.5px; background: var(--brand-gradient); color: #fff; border: none; font-weight: 700;">⚡ Zero-Lag Mirror</button>
+        </div>
+
+        <div class="phone-screen-wrapper" id="phoneScreenWrapper" data-phone-width="1080" data-phone-height="2400" onclick="handlePhoneScreenClick(event)">
+          <img id="phoneScreenImg" class="phone-screen-img" src="/stream.mjpg" alt="Live Phone Screen Video Stream">
+          <canvas id="bboxCanvas"></canvas>
+          <div id="touchRippleContainer"></div>
+        </div>
+
+        <div class="screen-state-badge" id="screenStateBadge" style="margin-top: 15px;">
+          SCREEN STATE: DETECTING...
+        </div>
+      </div>
+    </section>
+
+    <!-- Right Column: Voice Control & Visual Personality Dashboard -->
+    <section class="right-column">
+      
+      <!-- Voice Mic Hero & Agent Visual Personality Studio Card -->
+      <div class="glass-card voice-hero-card">
+        
+        <div class="visualizer-header">
+          <h2 class="card-title">✨ Visual Personality</h2>
+          <span class="personality-badge" id="activeStyleBadge">AURA</span>
+        </div>
+
+        <!-- Animated AI Consciousness Visualizer Stage -->
+        <div class="ai-avatar-container">
+          <canvas id="aiAvatarCanvas" width="200" height="200"></canvas>
+          <div class="ai-orb-glow" id="aiOrbGlow"></div>
+        </div>
+
+        <!-- Agent State Selector Pills -->
+        <div class="state-pill-selector">
+          <button class="state-pill active" id="pillListening" onclick="setAgentState('LISTENING')">LISTENING</button>
+          <button class="state-pill" id="pillSpeaking" onclick="setAgentState('SPEAKING')">SPEAKING</button>
+          <button class="state-pill" id="pillThinking" onclick="setAgentState('THINKING')">THINKING</button>
+          <button class="state-pill" id="pillConnecting" onclick="setAgentState('CONNECTING')">CONNECTING</button>
+        </div>
+
+        <!-- Visualizer Style Switcher Bar -->
+        <div class="visualizer-style-bar">
+          <button class="style-btn active" id="styleAura" onclick="setVisualizerStyle('AURA')">💫 AURA</button>
+          <button class="style-btn" id="styleWave" onclick="setVisualizerStyle('WAVE')">〰️ WAVE</button>
+          <button class="style-btn" id="styleRadial" onclick="setVisualizerStyle('RADIAL')">❇️ RADIAL</button>
+          <button class="style-btn" id="styleGrid" onclick="setVisualizerStyle('GRID')">⣿ GRID</button>
+          <button class="style-btn" id="styleBar" onclick="setVisualizerStyle('BAR')">📊 BAR</button>
+        </div>
+
+        <!-- Live Color Hue Controls -->
+        <div class="visualizer-controls">
+          <div class="control-row">
+            <label>COLOR HUE</label>
+            <input type="range" id="colorHueSlider" min="0" max="360" value="180" oninput="updateVisualizerParams()">
+            <span class="color-preview-dot" id="hueColorPreview"></span>
+          </div>
+        </div>
+
+        <div class="mic-button-wrapper" id="micWrapper" style="margin-top: 15px;">
+          <div class="mic-pulse-ring"></div>
+          <button class="mic-btn" id="micBtn" title="Click to Speak to LYRA">🎙️</button>
+        </div>
+
+        <p class="voice-status-text" id="voiceStatusText">Click microphone or speak to interact with LYRA</p>
+      </div>
+
+      <!-- Quick Action Controls Card -->
+      <div class="glass-card">
+        <div class="card-header">
+          <h2 class="card-title">⚡ Quick Phone Actions</h2>
+        </div>
+
+        <div class="action-grid">
+          <button class="action-btn" onclick="executeQuickAction('open_instagram')">📷 Instagram</button>
+          <button class="action-btn" onclick="executeQuickAction('open_camera')">📸 Camera</button>
+          <button class="action-btn" onclick="executeQuickAction('take_photo')">🔴 Take Photo</button>
+          <button class="action-btn" onclick="executeQuickAction('like_post')">❤️ Like Post</button>
+          <button class="action-btn" onclick="executeQuickAction('view_story')">⭕ View Story</button>
+          <button class="action-btn" onclick="executeQuickAction('go_home')">🏠 Go Home</button>
+        </div>
+      </div>
+
+      <!-- Grok AI Q&A Chat & Human Conversational Card -->
+      <div class="glass-card">
+        <div class="card-header">
+          <h2 class="card-title">💬 AI Assistant & Knowledge Q&A</h2>
+        </div>
+
+        <!-- Human Conversation Prompt Chips -->
+        <div class="suggestion-chips">
+          <button class="chip-btn" onclick="sendSuggestion('What is currently visible on my phone screen?')">🔍 Screen Status</button>
+          <button class="chip-btn" onclick="sendSuggestion('Open Camera and take a photo')">📸 Open Camera</button>
+          <button class="chip-btn" onclick="sendSuggestion('Open Instagram and like the first post')">❤️ Like Post</button>
+          <button class="chip-btn" onclick="sendSuggestion('What is the weather today?')">🌤️ Weather</button>
+        </div>
+
+        <div class="chat-log-box" id="chatLog">
+          <div class="chat-bubble assistant">
+            Hello! I am LYRA, your humanized AI phone assistant. Tap anywhere on the live phone mirror to physically control your phone, speak voice commands, or customize my visual personality above!
+          </div>
+        </div>
+
+        <form class="chat-input-bar" id="chatForm" onsubmit="handleFormSubmit(event)">
+          <input type="text" id="chatInput" class="chat-input" placeholder="Type a message or command..." autocomplete="off">
+          <button type="submit" class="send-btn">Send</button>
+        </form>
+      </div>
+
+    </section>
+
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

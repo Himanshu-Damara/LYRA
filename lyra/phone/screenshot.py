@@ -74,6 +74,37 @@ def capture_screenshot(
     return image, width, height, output_path
 
 
+def capture_screenshot_in_memory() -> Tuple[np.ndarray, int, int]:
+    """
+    Captures current phone screen via ADB binary directly into memory
+    WITHOUT writing any files to disk.
+
+    Returns:
+        Tuple containing:
+            - image (np.ndarray): Image in BGR format
+            - width (int): Screen width in pixels
+            - height (int): Screen height in pixels
+    """
+    cmd = [str(ADB_PATH), "exec-out", "screencap", "-p"]
+    try:
+        res = subprocess.run(cmd, capture_output=True, check=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"ADB screencap failed: {e.stderr.decode('utf-8', errors='ignore')}") from e
+
+    raw_bytes = res.stdout
+    if not raw_bytes:
+        raise RuntimeError("ADB screencap returned empty output!")
+
+    image_array = np.frombuffer(raw_bytes, dtype=np.uint8)
+    image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+
+    if image is None or image.size == 0:
+        raise ValueError("Failed to decode screenshot image from raw ADB bytes!")
+
+    height, width, _ = image.shape
+    return image, width, height
+
+
 def get_screen_resolution() -> Tuple[int, int]:
     """
     Queries actual device display resolution via ADB.
@@ -81,7 +112,7 @@ def get_screen_resolution() -> Tuple[int, int]:
     """
     cmd = [str(ADB_PATH), "shell", "wm", "size"]
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True, encoding='utf-8', errors='replace')
         out = res.stdout.strip()
         # Typical output: "Physical size: 720x1600"
         if "Physical size:" in out:

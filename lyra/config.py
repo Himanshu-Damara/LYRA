@@ -30,39 +30,20 @@ ADB_PATH = PROJECT_ROOT / "tools" / "platform-tools" / "adb.exe"
 # Do NOT hardcode resolution values here.
 PHONE_RESOLUTION = None  # Set at runtime by adb_controller
 
-# ── Model Vocabulary (Task 8 & Extended for DM / Gmail) ────────
+# ── Model Vocabulary (Finalized Task 8) ───────────────────────
 UI_ELEMENT_CLASSES = [
-    # App Launcher Icons
     "app_icon_instagram",   # Instagram launcher / home screen icon
     "app_icon_camera",      # Camera app launcher icon
     "app_icon_clock",       # Clock app launcher icon
-    "app_icon_gmail",       # Gmail app launcher icon
-
-    # Instagram Feed & Story
     "story_thumbnail",      # Story circle at top of Instagram feed
     "post_like_unliked",    # Unliked heart icon on Instagram post feed
     "post_like_liked",      # Liked (red) heart icon on Instagram post feed
     "story_like_unliked",   # Unliked heart icon on Instagram story
     "story_like_liked",     # Liked heart icon on Instagram story
-
-    # Instagram DM
-    "dm_icon",              # DM / Messenger icon on Instagram top bar
-    "dm_search_bar",        # Search bar in Instagram DM list
-    "chat_input_field",     # Text input area at bottom of Instagram chat
-    "send_message_button",  # Send button inside Instagram chat
-
-    # Gmail
-    "compose_email_button", # Compose button in Gmail main screen
-    "send_email_button",    # Send paper airplane icon in Gmail compose
-    "email_to_field",       # "To" recipient field in Gmail compose
-    "email_subject_field",  # "Subject" field in Gmail compose
-    "email_body_field",     # Message body input in Gmail compose
-
-    # General Controls
+    "close_button",         # Close / X button
     "shutter_button",       # Camera capture / shutter button
     "add_alarm_button",     # Plus (+) / add alarm button in Clock app
     "save_button",          # Save / confirm button
-    "close_button",         # Close / X button
     "back_button",          # UI back navigation button
 ]
 
@@ -70,13 +51,9 @@ SCREEN_STATE_CLASSES = [
     "HOME_SCREEN",          # Launcher / Home screen
     "INSTAGRAM_HOME",       # Instagram main feed
     "INSTAGRAM_STORY",      # Viewing Instagram story
-    "INSTAGRAM_DM_LIST",    # Instagram Direct Messages inbox list
-    "INSTAGRAM_CHAT",       # Open Instagram chat thread
     "CAMERA_VIEWFINDER",    # Camera app active viewfinder
     "CLOCK_MAIN",           # Clock app main alarms list
     "ALARM_CREATE",         # Add / edit alarm screen
-    "GMAIL_MAIN",           # Gmail inbox / main list screen
-    "GMAIL_COMPOSE",        # Gmail email creation / compose screen
     "UNKNOWN",              # Other / unrecognized screen state
 ]
 

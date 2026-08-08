@@ -1,15 +1,9 @@
-# Core ML
-torch
-torchvision
-
-# Image processing
-opencv-python
-Pillow
-numpy
-
-# Visualization
-matplotlib
-
-# API & config
 requests
 python-dotenv
+flask
+numpy
+opencv-python
+# Install the appropriate PyTorch build for your machine if it is not already present.
+# CPU-only Windows example: pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch
+torchvision

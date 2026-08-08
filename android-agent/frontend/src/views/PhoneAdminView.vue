@@ -1,0 +1,3480 @@
+<script setup lang="ts">
+import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { api } from '@/composables/useApi'
+
+const devices = ref<any[]>([])
+const selectedDevice = ref('')
+const selectedIsIos = computed(() => isIosDevice(selectedDevice.value))
+const hasIosDevices = computed(() => devices.value.some(d => isIosDevice(d.serial)))
+const hasAndroidDevices = computed(() => devices.value.some(d => !isIosDevice(d.serial)))
+const streaming = ref(false)
+const subTab = ref<'single' | 'multi'>('single')
+const nickname = ref('')
+const editingNickname = ref(false)
+let logTimer: number | null = null
+const srvLogs = ref<string[]>([])
+const botLogs = ref<string[]>([])
+let srvSeq = 0
+const statusText = ref('')
+
+/* ── log level filter ─────────────────────────────────────────────────── */
+const logFilter = ref<string>('All')
+const LOG_FILTERS = ['All', 'Error', 'Warn', 'App', 'Flask'] as const
+const logsOpen = ref(false)
+
+const filteredSrvLogs = computed(() => {
+  const logs = srvLogs.value.slice(-50)
+  const f = logFilter.value
+  if (f === 'All') return logs
+  if (f === 'Error') return logs.filter(l => l.includes('[ERROR]') || l.includes('[CRITICAL]'))
+  if (f === 'Warn') return logs.filter(l => l.includes('[WARN') || l.includes('[WARNING]'))
+  if (f === 'App') return logs.filter(l => !l.includes('[Flask]') && !l.includes('werkzeug'))
+  if (f === 'Flask') return logs.filter(l => l.includes('[Flask]') || l.includes('werkzeug') || l.includes('HTTP'))
+  return logs
+})
+
+/* ── bot log type selector ────────────────────────────────────────────── */
+const botLogType = ref('bot')
+const BOT_LOG_TYPES = [
+  { value: 'bot', label: 'Bot' },
+  { value: 'post', label: 'Post Bot' },
+]
+
+/* ══════════════════════════════════════════════════════════════════════════
+   WebRTC streaming — shared logic for single + multi device
+   ══════════════════════════════════════════════════════════════════════════ */
+interface RtcSession { pc: RTCPeerConnection; sessionId: string; pollTimer: number; sse: EventSource | null; status: string }
+const rtcSessions = ref<Record<string, RtcSession>>({})
+const rtcStatus = ref<Record<string, string>>({})
+
+interface RecordingResponse {
+  ok?: boolean
+  running?: boolean
+  filename?: string
+  mode?: string
+  url?: string
+  error?: string
+}
+
+type NewsResult = {
+  ok?: boolean
+  error?: string
+  current_url?: string
+  headlines?: any[]
+  articles?: any[]
+  errors?: any[]
+  extraction?: any
+  completion?: any
+  screenshots?: Record<string, string>
+}
+
+type StreamMode = 'rtc' | 'mjpeg' | 'h264'
+
+type StreamInfo = {
+  ok?: boolean
+  platform?: string
+  requested_mode?: string
+  effective_mode?: string
+  recommended_mode?: string
+  fallback_mode?: string
+  stream_url?: string
+  mjpeg_url?: string
+  mjpeg_settings?: Record<string, unknown>
+  unsupported_actions?: string[]
+  recovery?: Record<string, unknown>
+  error?: string
+}
+
+function isIosSerial(serial: string | null | undefined): boolean {
+  return !!serial && serial.startsWith('ios:')
+}
+
+function devicePlatform(serial: string | null | undefined): 'ios' | 'android' {
+  const row = devices.value.find((d: any) => d.serial === serial)
+  const platform = String(row?.platform || row?.device_platform || '').toLowerCase()
+  if (platform === 'ios' || platform === 'android') return platform
+  return isIosSerial(serial) ? 'ios' : 'android'
+}
+
+function isIosDevice(serial: string | null | undefined): boolean {
+  return devicePlatform(serial) === 'ios'
+}
+
+function mjpegStreamUrl(serial: string): string {
+  const modeParam = isIosDevice(serial) ? '&mode=wda-mjpeg' : ''
+  return `/api/phone/stream?device=${encodeURIComponent(serial)}&fps=5${modeParam}`
+}
+
+function effectiveStreamMode(serial: string, mode: StreamMode): StreamMode {
+  if (mode === 'h264') return mode
+  return isIosDevice(serial) ? 'mjpeg' : mode
+}
+
+function streamModeText(serial: string, mode: StreamMode): string {
+  if (mode === 'h264') return 'H.264'
+  if (mode === 'rtc') return 'WebRTC'
+  return isIosDevice(serial) ? 'WDA MJPEG' : 'MJPEG'
+}
+
+function streamModeTitle(serial: string, mode: StreamMode): string {
+  if (mode === 'h264') return 'GhostAgent H.264 stream'
+  if (isIosDevice(serial)) return 'iOS streams through WebDriverAgent MJPEG'
+  return mode === 'rtc' ? 'Android Portal WebRTC stream' : 'Android MJPEG fallback stream'
+}
+
+function multiStreamLabel(serial: string): string {
+  const mode = multiStreamMode.value[serial] || 'mjpeg'
+  if (mode === 'rtc') return rtcStatus.value[serial] || 'RTC'
+  return streamModeText(serial, mode)
+}
+
+function streamFallbackUrl(serial: string, fallback?: any): string {
+  const url = String(fallback?.url || '').trim()
+  return url || mjpegStreamUrl(serial)
+}
+
+const streamInfo = ref<Record<string, StreamInfo>>({})
+const streamInfoStatus = ref<Record<string, string>>({})
+
+function streamInfoModeParam(serial: string, mode: StreamMode): string {
+  if (isIosDevice(serial)) return 'mjpeg'
+  return mode === 'rtc' ? 'portal' : 'screencap'
+}
+
+function streamInfoTitle(serial: string): string {
+  const info = streamInfo.value[serial]
+  if (!info) return streamModeTitle(serial, multiStreamMode.value[serial] || singleStreamMode.value)
+  const parts = [
+    info.effective_mode ? `mode ${info.effective_mode}` : '',
+    info.fallback_mode ? `fallback ${info.fallback_mode}` : '',
+    info.unsupported_actions?.length ? `unsupported ${info.unsupported_actions.join(', ')}` : '',
+  ].filter(Boolean)
+  return parts.join(' | ') || streamModeTitle(serial, multiStreamMode.value[serial] || singleStreamMode.value)
+}
+
+async function resolveMjpegStreamUrl(serial: string, mode: StreamMode): Promise<string> {
+  const fallback = mjpegStreamUrl(serial)
+  try {
+    const info = await api<StreamInfo>(
+      `/api/phone/stream-info?device=${encodeURIComponent(serial)}&fps=5&mode=${encodeURIComponent(streamInfoModeParam(serial, mode))}`
+    )
+    streamInfo.value[serial] = info
+    streamInfoStatus.value[serial] = ''
+    return String(info.stream_url || fallback)
+  } catch (error) {
+    streamInfoStatus.value[serial] = error instanceof Error ? error.message.replace(/^API \d+:\s*/, '') : 'Stream metadata unavailable'
+    return fallback
+  }
+}
+
+function applyIosStreamFallback(serial: string, fallback?: any) {
+  rtcStatus.value[serial] = 'WDA MJPEG'
+  if (serial === selectedDevice.value) {
+    singleStreamMode.value = 'mjpeg'
+    singleMjpegUrl.value = streamFallbackUrl(serial, fallback)
+  }
+  if (multiStreaming.value[serial]) {
+    multiStreamMode.value[serial] = 'mjpeg'
+    mjpegUrls.value[serial] = streamFallbackUrl(serial, fallback)
+  }
+}
+
+function blackWarningText(serial: string): string {
+  return isIosDevice(serial) ? 'WDA stream stalled' : 'FLAG_SECURE - switch to MJPEG'
+}
+
+function streamPlaceholderText(serial: string): string {
+  return isIosDevice(serial) ? 'Press play for WDA MJPEG' : 'Press WebRTC or MJPEG'
+}
+
+function uuid(): string {
+  return ([1e7] as any + -1e3 + -4e3 + -8e3 + -1e11).replace(/[018]/g, (c: any) =>
+    (c ^ ((crypto.getRandomValues(new Uint8Array(1))[0] ?? 0) & 15) >> c / 4).toString(16))
+}
+
+async function rtcFixPortal(serial: string) {
+  rtcStatus.value[serial] = 'Fixing Portal...'
+  try {
+    const r = await api(`/api/phone/portal-fix/${serial}`, { method: 'POST' })
+    rtcStatus.value[serial] = r.ok ? 'Portal fixed — retry stream' : ('Fix failed: ' + (r.error || ''))
+  } catch { rtcStatus.value[serial] = 'Fix failed' }
+}
+
+async function rtcStart(serial: string, _reconnectAttempt = 0) {
+  console.log(`[RTC ${serial}] rtcStart called (attempt=${_reconnectAttempt})`)
+  if (isIosDevice(serial)) {
+    applyIosStreamFallback(serial)
+    return
+  }
+  if (rtcSessions.value[serial]) rtcStop(serial)
+  const sessionId = uuid()
+  const t0 = performance.now()
+  rtcStatus.value[serial] = 'Requesting...'
+
+  const startRes = await api('/api/phone/webrtc-signal', {
+    method: 'POST',
+    body: JSON.stringify({ device: serial, method: 'stream/start', params: { sessionId, width: 720, height: 1280, fps: 30 } })
+  })
+
+  console.log(`[RTC ${serial}] stream/start response:`, JSON.stringify(startRes).substring(0, 100))
+  if (!startRes.ok) {
+    if (startRes.platform === 'ios' && startRes.stream_fallback) {
+      applyIosStreamFallback(serial, startRes.stream_fallback)
+      return
+    }
+    const err = startRes.error || 'unknown'
+    if (err.includes('Accessibility') || err.includes('Portal not')) {
+      rtcStatus.value[serial] = 'Portal down — fixing...'
+      await rtcFixPortal(serial)
+      const retry = await api('/api/phone/webrtc-signal', {
+        method: 'POST',
+        body: JSON.stringify({ device: serial, method: 'stream/start', params: { sessionId, width: 720, height: 1280, fps: 30 } })
+      })
+      if (!retry.ok) { rtcStatus.value[serial] = 'Portal fix failed: ' + (retry.error || err); return }
+    } else { rtcStatus.value[serial] = 'Failed: ' + err; return }
+  }
+
+  const pc = new RTCPeerConnection({
+    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+    iceCandidatePoolSize: 1,  // Pre-allocate candidates for faster ICE
+  })
+  setupDataChannel(serial, pc)
+
+  pc.ontrack = (evt) => {
+    rtcStatus.value[serial] = 'Streaming'
+    const videoEl = document.getElementById(`rtc-video-${serial}`) as HTMLVideoElement
+    const stream = evt.streams[0]
+    if (videoEl && stream) {
+      videoEl.srcObject = stream
+      videoEl.play().catch(() => {})
+    }
+    startBlackCheck(serial)
+    console.log(`[RTC ${serial}] First frame in ${(performance.now() - t0).toFixed(0)}ms`)
+  }
+
+  pc.onicecandidate = (evt) => {
+    if (evt.candidate) {
+      api('/api/phone/webrtc-signal', {
+        method: 'POST',
+        body: JSON.stringify({ device: serial, method: 'webrtc/ice',
+          params: { candidate: evt.candidate.candidate, sdpMid: evt.candidate.sdpMid,
+            sdpMLineIndex: evt.candidate.sdpMLineIndex, sessionId } })
+      })
+    }
+  }
+
+  // Auto-reconnect on ICE failure (up to 3 attempts)
+  pc.oniceconnectionstatechange = () => {
+    const st = pc.iceConnectionState
+    if (st === 'connected' || st === 'completed') {
+      rtcStatus.value[serial] = 'Streaming'
+      // Close SSE once ICE is stable — signals no longer needed
+      const sess = rtcSessions.value[serial]
+      if (sess?.sse) { sess.sse.close(); sess.sse = null }
+    } else if (st === 'disconnected') {
+      rtcStatus.value[serial] = 'Reconnecting...'
+    } else if (st === 'failed') {
+      rtcStatus.value[serial] = 'ICE failed'
+      if (_reconnectAttempt < 3) {
+        console.log(`[RTC ${serial}] Auto-reconnect attempt ${_reconnectAttempt + 1}/3`)
+        rtcStatus.value[serial] = `Reconnecting (${_reconnectAttempt + 1}/3)...`
+        setTimeout(() => rtcStart(serial, _reconnectAttempt + 1), 500)
+      }
+    } else if (st === 'checking') {
+      rtcStatus.value[serial] = 'Connecting...'
+    }
+  }
+
+  // Register session and start signal polling
+  rtcStatus.value[serial] = 'Waiting for offer...'
+
+  // Poll for signaling messages from phone
+  let sse: EventSource | null = null
+  console.log(`[RTC ${serial}] Starting poll timer (100ms interval)`)
+  const pollTimer = window.setInterval(async () => {
+    try {
+      const r = await fetch(`/api/phone/webrtc-poll-signals/${serial}`)
+      const d = await r.json()
+      if (d.ok && d.messages?.length) {
+        // Sort: process offers/answers BEFORE ICE candidates (they may arrive out of order)
+        const msgs = d.messages.filter((m: any) => m.result !== 'prompting_user' && m.result !== 'reusing_capture')
+        const parsed = msgs.map((data: any) => {
+          const payload = data.payload ? (typeof data.payload === 'string' ? JSON.parse(data.payload) : data.payload) : data
+          return { method: payload.method || data.method, params: payload.params || payload }
+        })
+        // Offers first, then answers, then ICE
+        const ordered = [
+          ...parsed.filter((m: any) => m.method === 'webrtc/offer'),
+          ...parsed.filter((m: any) => m.method === 'webrtc/answer'),
+          ...parsed.filter((m: any) => m.method === 'webrtc/ice'),
+        ]
+        for (const { method: m, params: p } of ordered) {
+          if (m === 'webrtc/offer' && p.sdp) {
+            rtcStatus.value[serial] = 'Got offer...'
+            await pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: p.sdp }))
+            const answer = await pc.createAnswer()
+            await pc.setLocalDescription(answer)
+            await api('/api/phone/webrtc-signal', {
+              method: 'POST',
+              body: JSON.stringify({ device: serial, method: 'webrtc/answer',
+                params: { sdp: pc.localDescription!.sdp, sessionId: p.sessionId || sessionId } })
+            })
+            rtcStatus.value[serial] = 'Connecting...'
+          } else if (m === 'webrtc/answer' && p.sdp) {
+            await pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: p.sdp }))
+          } else if (m === 'webrtc/ice' && p.candidate && pc.remoteDescription) {
+            await pc.addIceCandidate(new RTCIceCandidate({ candidate: p.candidate, sdpMid: p.sdpMid, sdpMLineIndex: p.sdpMLineIndex }))
+          }
+        }
+      }
+    } catch (e: any) { console.error(`[RTC ${serial}] poll error:`, e?.message || e) }
+  }, 100)  // 100ms poll for fast signaling
+
+  rtcSessions.value[serial] = { pc, sessionId, pollTimer, sse: null, status: 'connecting' }
+}
+
+function rtcStop(serial: string) {
+  clearBlackCheck(serial)
+  const sess = rtcSessions.value[serial]
+  if (!sess) return
+  if (sess.pollTimer) clearInterval(sess.pollTimer)
+  if (sess.sse) { sess.sse.close(); sess.sse = null }
+  api('/api/phone/webrtc-signal', {
+    method: 'POST',
+    body: JSON.stringify({ device: serial, method: 'stream/stop', params: { sessionId: sess.sessionId } })
+  }).catch(() => {})
+  sess.pc.close()
+  delete rtcSessions.value[serial]
+  rtcStatus.value[serial] = ''
+  const videoEl = document.getElementById(`rtc-video-${serial}`) as HTMLVideoElement
+  if (videoEl) videoEl.srcObject = null
+}
+
+/* ── DataChannel input (low-latency) with HTTP fallback ─────────────── */
+function sendInput(_serial: string, _msg: object): boolean {
+  // DataChannel input disabled — portal can't exec shell "input" commands
+  // without root. Will implement via AccessibilityService dispatchGesture() later.
+  // For now, always fall through to HTTP → backend platform control.
+  return false
+}
+
+function setupDataChannel(serial: string, pc: RTCPeerConnection) {
+  try {
+    const dc = pc.createDataChannel('control', { ordered: true, negotiated: true, id: 1 })
+    dc.onopen = () => { console.log(`[RTC ${serial}] DataChannel open`); (rtcSessions.value[serial] as any)._dc = dc }
+    dc.onclose = () => { (rtcSessions.value[serial] as any)._dc = undefined }
+  } catch (e) { console.warn('[RTC] DataChannel setup failed:', e) }
+}
+
+/* ── tap/swipe on video element ──────────────────────────────────────── */
+interface DragState { x: number; y: number; t: number }
+const dragState = ref<Record<string, DragState | null>>({})
+const dragMoved = ref<Record<string, boolean>>({})
+
+function videoMouseDown(serial: string, e: MouseEvent) {
+  e.preventDefault()
+  const video = e.target as HTMLVideoElement
+  const rect = video.getBoundingClientRect()
+  const sx = video.videoWidth / rect.width, sy = video.videoHeight / rect.height
+  dragState.value[serial] = { x: Math.round((e.clientX - rect.left) * sx), y: Math.round((e.clientY - rect.top) * sy), t: Date.now() }
+  dragMoved.value[serial] = false
+}
+
+function videoMouseMove(serial: string) {
+  if (dragState.value[serial]) dragMoved.value[serial] = true
+}
+
+function videoMouseUp(serial: string, e: MouseEvent) {
+  const ds = dragState.value[serial]
+  if (!ds) return
+  e.preventDefault()
+  const video = e.target as HTMLVideoElement
+  const rect = video.getBoundingClientRect()
+  const sx = video.videoWidth / rect.width, sy = video.videoHeight / rect.height
+  const ex = Math.round((e.clientX - rect.left) * sx), ey = Math.round((e.clientY - rect.top) * sy)
+  const sw = video.videoWidth, sh = video.videoHeight
+  const dx = ex - ds.x, dy = ey - ds.y, dist = Math.sqrt(dx * dx + dy * dy)
+  if (!dragMoved.value[serial] || dist < 20) {
+    if (!sendInput(serial, { action: 'tap', x: ex, y: ey }))
+      api('/api/phone/tap', { method: 'POST', body: JSON.stringify({ device: serial, x: ex, y: ey, stream_w: sw, stream_h: sh }) })
+  } else {
+    if (!sendInput(serial, { action: 'swipe', x1: ds.x, y1: ds.y, x2: ex, y2: ey, duration: 300 }))
+      api('/api/phone/swipe', { method: 'POST', body: JSON.stringify({ device: serial, x1: ds.x, y1: ds.y, x2: ex, y2: ey, stream_w: sw, stream_h: sh }) })
+  }
+  dragState.value[serial] = null
+}
+
+function videoMouseLeave(serial: string) { dragState.value[serial] = null }
+
+function videoTouchStart(serial: string, e: TouchEvent) {
+  if (!e.touches.length) return; e.preventDefault()
+  const touch = e.touches[0], video = e.target as HTMLVideoElement, rect = video.getBoundingClientRect()
+  if (!touch) return
+  const sx = video.videoWidth / rect.width, sy = video.videoHeight / rect.height
+  dragState.value[serial] = { x: Math.round((touch.clientX - rect.left) * sx), y: Math.round((touch.clientY - rect.top) * sy), t: Date.now() }
+  dragMoved.value[serial] = false
+}
+function videoTouchMove(serial: string) { if (dragState.value[serial]) dragMoved.value[serial] = true }
+function videoTouchEnd(serial: string, e: TouchEvent) {
+  const ds = dragState.value[serial]; if (!ds) return; e.preventDefault()
+  const touch = e.changedTouches[0], video = e.target as HTMLVideoElement, rect = video.getBoundingClientRect()
+  if (!touch) return
+  const sx = video.videoWidth / rect.width, sy = video.videoHeight / rect.height
+  const ex = Math.round((touch.clientX - rect.left) * sx), ey = Math.round((touch.clientY - rect.top) * sy)
+  const sw = video.videoWidth, sh = video.videoHeight
+  const dx = ex - ds.x, dy = ey - ds.y, dist = Math.sqrt(dx * dx + dy * dy)
+  if (!dragMoved.value[serial] || dist < 20) {
+    if (!sendInput(serial, { action: 'tap', x: ex, y: ey }))
+      api('/api/phone/tap', { method: 'POST', body: JSON.stringify({ device: serial, x: ex, y: ey, stream_w: sw, stream_h: sh }) })
+  } else {
+    if (!sendInput(serial, { action: 'swipe', x1: ds.x, y1: ds.y, x2: ex, y2: ey, duration: 300 }))
+      api('/api/phone/swipe', { method: 'POST', body: JSON.stringify({ device: serial, x1: ds.x, y1: ds.y, x2: ex, y2: ey, stream_w: sw, stream_h: sh }) })
+  }
+  dragState.value[serial] = null
+}
+
+function sendKeyTo(serial: string, key: number | string) {
+  // Use /api/phone/key for string keys (BACK, HOME, etc.) and /api/phone/input for numeric keycodes
+  if (typeof key === 'string') {
+    api('/api/phone/key', { method: 'POST', body: JSON.stringify({ device: serial, key }) })
+  } else {
+    api('/api/phone/input', { method: 'POST', body: JSON.stringify({ device: serial, action: 'keyevent', keycode: key }) })
+  }
+}
+
+function hardwareKeys(serial: string): { label: string; key: number | string; title: string }[] {
+  if (isIosDevice(serial)) {
+    return [
+      { label: 'Back', key: 'BACK', title: 'Back' },
+      { label: 'Home', key: 'HOME', title: 'Home' },
+      { label: 'Enter', key: 'ENTER', title: 'Enter' },
+    ]
+  }
+  return [
+    { label: '\u25C0', key: 4, title: 'Back' },
+    { label: '\u2302', key: 3, title: 'Home' },
+    { label: '\u25A6', key: 187, title: 'Recents' },
+    { label: '\u23FB', key: 26, title: 'Power' },
+    { label: 'Vol+', key: 24, title: 'Volume up' },
+    { label: 'Vol-', key: 25, title: 'Volume down' },
+  ]
+}
+
+/* ── screen recording ───────────────────────────────────────────────── */
+const recordingState = ref<Record<string, boolean>>({})
+const recordingBusy = ref<Record<string, boolean>>({})
+const recordingStatus = ref<Record<string, string>>({})
+const recordingUrls = ref<Record<string, string>>({})
+const recordingFilenames = ref<Record<string, string>>({})
+
+function applyRecordingStatus(serial: string, result: RecordingResponse) {
+  recordingState.value[serial] = !!result.running
+  if (result.filename) recordingFilenames.value[serial] = result.filename
+  if (result.url) recordingUrls.value[serial] = result.url
+  if (result.error) {
+    recordingStatus.value[serial] = result.error
+  } else if (result.running) {
+    recordingStatus.value[serial] = result.mode ? `Recording ${result.mode}` : 'Recording'
+  } else if (result.url) {
+    recordingStatus.value[serial] = 'Saved recording'
+  } else {
+    recordingStatus.value[serial] = ''
+  }
+}
+
+function recordingErrorText(error: unknown): string {
+  if (error instanceof Error) return error.message.replace(/^API \d+:\s*/, '')
+  return 'Recording request failed'
+}
+
+async function refreshRecordingStatus(serial: string) {
+  if (!serial) return
+  try {
+    const result = await api<RecordingResponse>(`/api/phone/recording/status/${encodeURIComponent(serial)}`)
+    applyRecordingStatus(serial, result)
+  } catch (error) {
+    recordingStatus.value[serial] = recordingErrorText(error)
+  }
+}
+
+function refreshAllRecordingStatus() {
+  for (const d of devices.value) refreshRecordingStatus(d.serial)
+}
+
+function recordingButtonText(serial: string): string {
+  if (recordingBusy.value[serial]) return '...'
+  return recordingState.value[serial] ? 'Stop Rec' : 'Record'
+}
+
+function recordingTinyText(serial: string): string {
+  if (recordingBusy.value[serial]) return '...'
+  return recordingState.value[serial] ? 'Stop' : 'Rec'
+}
+
+function recordingTitle(serial: string): string {
+  if (recordingState.value[serial]) return 'Stop screen recording and save MP4'
+  return isIosDevice(serial) ? 'Record WDA MJPEG stream to MP4' : 'Record Android screen to MP4'
+}
+
+async function toggleRecording(serial: string) {
+  if (!serial || recordingBusy.value[serial]) return
+  recordingBusy.value[serial] = true
+  recordingStatus.value[serial] = ''
+  try {
+    const endpoint = recordingState.value[serial] ? '/api/phone/recording/stop' : '/api/phone/recording/start'
+    const result = await api<RecordingResponse>(endpoint, {
+      method: 'POST',
+      body: JSON.stringify({ device: serial })
+    })
+    applyRecordingStatus(serial, result)
+  } catch (error) {
+    recordingStatus.value[serial] = recordingErrorText(error)
+  } finally {
+    recordingBusy.value[serial] = false
+  }
+}
+
+/* ── iOS browser/news smoke workflow ────────────────────────────────── */
+const newsUrl = ref('https://text.npr.org/')
+const newsBundleId = ref('com.google.chrome.ios')
+const newsMaxHeadlines = ref(5)
+const newsMaxArticles = ref(3)
+const newsWaitSeconds = ref(2)
+const newsSaveScreenshots = ref(true)
+const newsOutDir = ref('data/ios_chrome_news_smoke')
+const newsRunning = ref(false)
+const newsResult = ref<NewsResult | null>(null)
+const newsError = ref('')
+
+const newsHeadlines = computed(() => Array.isArray(newsResult.value?.headlines) ? newsResult.value!.headlines! : [])
+const newsArticles = computed(() => Array.isArray(newsResult.value?.articles) ? newsResult.value!.articles! : [])
+const newsErrors = computed(() => Array.isArray(newsResult.value?.errors) ? newsResult.value!.errors! : [])
+const newsExtraction = computed(() => newsResult.value?.extraction || {})
+const newsScreenshotEntries = computed(() =>
+  Object.entries(newsResult.value?.screenshots || {}).filter(([, path]) => !!path)
+)
+
+function compactEvidence(evidence: any): string {
+  if (!evidence) return ''
+  const source = evidence.source || 'unknown'
+  const attempts = evidence.attempts !== undefined ? `${evidence.attempts}x` : ''
+  if (evidence.returned !== undefined) return `${source} ${evidence.returned}/${evidence.target} ${attempts}`.trim()
+  if (evidence.returned_lines !== undefined) {
+    return `${source} ${evidence.returned_lines}/${evidence.target_lines} lines ${attempts}`.trim()
+  }
+  return source
+}
+
+function articleEvidence(index: number): any {
+  const items = newsExtraction.value?.articles
+  return Array.isArray(items) ? items[index] || {} : {}
+}
+
+function firstNewsError(): string {
+  if (newsResult.value?.error) return String(newsResult.value.error)
+  const first = newsErrors.value[0]
+  if (!first) return ''
+  return String(first.error || first.back_error || first.stage || first.article || JSON.stringify(first))
+}
+
+async function runNewsSmoke() {
+  if (!selectedDevice.value || newsRunning.value) return
+  newsRunning.value = true
+  newsError.value = ''
+  newsResult.value = null
+  try {
+    const result = await api<NewsResult>('/api/phone/browser/read-news', {
+      method: 'POST',
+      body: JSON.stringify({
+        device: selectedDevice.value,
+        url: newsUrl.value || 'https://text.npr.org/',
+        bundle_id: newsBundleId.value || undefined,
+        max_headlines: Math.max(1, Number(newsMaxHeadlines.value) || 5),
+        max_articles: Math.max(0, Number(newsMaxArticles.value) || 0),
+        wait_s: Math.max(0.5, Number(newsWaitSeconds.value) || 2),
+        save_screenshots: newsSaveScreenshots.value,
+        out_dir: newsOutDir.value || undefined,
+      })
+    })
+    newsResult.value = result
+    if (!result.ok) newsError.value = firstNewsError() || 'News workflow failed'
+  } catch (error) {
+    newsError.value = error instanceof Error ? error.message.replace(/^API \d+:\s*/, '') : 'News workflow failed'
+  } finally {
+    newsRunning.value = false
+  }
+}
+
+/* ── Frozen stream detection ──────────────────────────────────────────── */
+const streamFrozen = ref<Record<string, boolean>>({})
+const frozenTimers = ref<Record<string, number>>({})
+const lastFrameHash = ref<Record<string, string>>({})
+const frozenCount = ref<Record<string, number>>({})
+// Also keep blackWarning for FLAG_SECURE
+const blackWarning = ref<Record<string, boolean>>({})
+
+function startBlackCheck(serial: string) {
+  clearBlackCheck(serial)
+  lastFrameHash.value[serial] = ''
+  frozenCount.value[serial] = 0
+  streamFrozen.value[serial] = false
+
+  // Start periodic check: every 3s, sample video frame, compare hash
+  frozenTimers.value[serial] = window.setInterval(() => {
+    const video = document.getElementById(`rtc-video-${serial}`) as HTMLVideoElement
+    if (!video || !video.videoWidth) return
+    try {
+      const c = document.createElement('canvas')
+      c.width = 8; c.height = 8
+      c.getContext('2d')!.drawImage(video, 0, 0, 8, 8)
+      const data = c.getContext('2d')!.getImageData(0, 0, 8, 8).data
+      // Simple hash: sum of all pixel values
+      let hash = 0
+      for (let i = 0; i < data.length; i += 4) hash += (data[i] ?? 0) + (data[i+1] ?? 0) + (data[i+2] ?? 0)
+      const hashStr = hash.toString()
+
+      // Black screen check (first time only)
+      if (!lastFrameHash.value[serial] && hash / (8 * 8 * 3) < 3) {
+        blackWarning.value[serial] = true
+        setTimeout(() => { blackWarning.value[serial] = false }, 6000)
+      }
+
+      // Only check ICE state — if ICE is dead, stream is dead. Period.
+      const sess = rtcSessions.value[serial]
+      const iceState = sess?.pc?.iceConnectionState
+      if (iceState === 'disconnected' || iceState === 'failed' || iceState === 'closed') {
+        streamFrozen.value[serial] = true
+      } else {
+        streamFrozen.value[serial] = false
+      }
+    } catch {}
+  }, 3000)
+}
+
+function clearBlackCheck(serial: string) {
+  if (frozenTimers.value[serial]) { clearInterval(frozenTimers.value[serial]); delete frozenTimers.value[serial] }
+  streamFrozen.value[serial] = false
+  blackWarning.value[serial] = false
+  frozenCount.value[serial] = 0
+  lastFrameHash.value[serial] = ''
+}
+
+function reconnectStream(serial: string) {
+  streamFrozen.value[serial] = false
+  if (isIosDevice(serial)) {
+    if (streaming.value && serial === selectedDevice.value) {
+      stopStream()
+      singleStreamMode.value = 'mjpeg'
+      setTimeout(() => startStream(), 500)
+    } else {
+      stopMultiStream(serial)
+      setTimeout(() => startMultiStream(serial, 'mjpeg'), 500)
+    }
+    return
+  }
+  rtcStop(serial)
+  setTimeout(() => rtcStart(serial), 500)
+}
+
+/* ── toggle stream mode (switch while streaming) ────────────────────── */
+function toggleMultiMode(serial: string) {
+  if (!multiStreaming.value[serial]) return
+  if (isIosDevice(serial)) return
+  const newMode = multiStreamMode.value[serial] === 'rtc' ? 'mjpeg' : 'rtc'
+  stopMultiStream(serial)
+  startMultiStream(serial, newMode)
+}
+
+function toggleSingleMode() {
+  if (!streaming.value || !selectedDevice.value) return
+  if (selectedIsIos.value) return
+  stopStream()
+  singleStreamMode.value = singleStreamMode.value === 'rtc' ? 'mjpeg' : 'rtc'
+  startStream()
+}
+
+/* ── UI grid overlay toggle ──────────────────────────────────────────── */
+const overlayOn = ref<Record<string, boolean>>({})
+
+async function toggleOverlay(serial: string) {
+  if (isIosDevice(serial)) return
+  overlayOn.value[serial] = !overlayOn.value[serial]
+  await api(`/api/phone/overlay/${serial}`, {
+    method: 'POST', body: JSON.stringify({ visible: overlayOn.value[serial] })
+  })
+}
+
+/* ── multi-device ────────────────────────────────────────────────────── */
+const multiStreaming = ref<Record<string, boolean>>({})
+const multiStreamMode = ref<Record<string, 'rtc' | 'mjpeg'>>({})
+const mjpegUrls = ref<Record<string, string>>({})
+
+async function startMultiStream(serial: string, mode: 'rtc' | 'mjpeg' = 'rtc') {
+  // Clean up any existing stream first
+  if (multiStreaming.value[serial]) stopMultiStream(serial)
+  const actualMode = effectiveStreamMode(serial, mode) as 'rtc' | 'mjpeg'
+  multiStreaming.value[serial] = true
+  multiStreamMode.value[serial] = actualMode
+  if (actualMode === 'rtc') {
+    rtcStart(serial)
+  } else {
+    streamFrozen.value[serial] = false
+    mjpegReconnects.value[serial] = 0
+    streamInfoStatus.value[serial] = isIosDevice(serial) ? 'Loading WDA MJPEG...' : ''
+    mjpegUrls.value[serial] = mjpegStreamUrl(serial)
+    mjpegUrls.value[serial] = await resolveMjpegStreamUrl(serial, actualMode)
+    startMjpegWatchdog(serial)
+  }
+}
+function stopMultiStream(serial: string) {
+  multiStreaming.value[serial] = false
+  if (multiStreamMode.value[serial] === 'rtc') rtcStop(serial)
+  stopMjpegWatchdog(serial)
+  mjpegUrls.value[serial] = ''
+  streamInfoStatus.value[serial] = ''
+  multiStreamMode.value[serial] = 'rtc'
+}
+function startAllStreams(mode: 'rtc' | 'mjpeg' = 'rtc') {
+  for (const d of devices.value) { if (!multiStreaming.value[d.serial]) startMultiStream(d.serial, mode) }
+}
+function stopAllStreams() { for (const d of devices.value) stopMultiStream(d.serial) }
+
+/* ── single device ───────────────────────────────────────────────────── */
+const singleStreamMode = ref<'rtc' | 'mjpeg' | 'h264'>('rtc')
+const singleMjpegUrl = ref('')
+
+/* ── H.264 (GhostAgent WebSocket stream, iOS) ─────────────────────────── */
+const h264Status = ref('')
+const h264ShowMetrics = ref(true)
+const h264M = ref({ recvFps: 0, renderFps: 0, queue: 0, latencyMs: 0, kbps: 0, dropped: 0 })
+let h264Handle: { status: any; recvFps: any; renderFps: any; queue: any; latencyMs: any; kbps: any; dropped: any; stop: () => void } | null = null
+function h264StreamWsUrl(serial: string): string {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+  return `${proto}://${location.host}/api/phone/h264/${encodeURIComponent(serial)}`
+}
+async function startH264(serial: string) {
+  stopH264()
+  await nextTick()
+  const canvas = document.getElementById(`h264-canvas-${serial}`) as HTMLCanvasElement | null
+  if (!canvas) return
+  const { startH264Stream, h264Supported } = await import('@/composables/useH264Stream')
+  if (!h264Supported()) { h264Status.value = 'WebCodecs unavailable — use MJPEG'; return }
+  h264Handle = startH264Stream(h264StreamWsUrl(serial), canvas)
+  const h = h264Handle
+  watch(h.status, (v: string) => { h264Status.value = v })
+  const sync = () => { h264M.value = { recvFps: h.recvFps.value, renderFps: h.renderFps.value, queue: h.queue.value, latencyMs: h.latencyMs.value, kbps: h.kbps.value, dropped: h.dropped.value } }
+  watch([h.recvFps, h.renderFps, h.queue, h.latencyMs, h.kbps, h.dropped], sync)
+}
+function stopH264() {
+  if (h264Handle) { h264Handle.stop(); h264Handle = null }
+  h264Status.value = ''
+  h264M.value = { recvFps: 0, renderFps: 0, queue: 0, latencyMs: 0, kbps: 0, dropped: 0 }
+}
+
+async function startStream() {
+  if (!selectedDevice.value) return
+  const serial = selectedDevice.value
+  if (singleStreamMode.value !== 'h264') singleStreamMode.value = effectiveStreamMode(serial, singleStreamMode.value)
+  streaming.value = true
+  if (singleStreamMode.value === 'h264') {
+    await startH264(serial)
+  } else if (singleStreamMode.value === 'rtc') {
+    rtcStart(serial)
+    // Auto-fallback: if RTC doesn't connect within 5s, switch to MJPEG
+    setTimeout(() => {
+      if (streaming.value && singleStreamMode.value === 'rtc' && rtcStatus.value[serial] !== 'Streaming') {
+        console.log('RTC timeout — falling back to MJPEG')
+        singleStreamMode.value = 'mjpeg'
+        singleMjpegUrl.value = mjpegStreamUrl(serial)
+        void resolveMjpegStreamUrl(serial, 'mjpeg').then(url => {
+          if (streaming.value && selectedDevice.value === serial && singleStreamMode.value === 'mjpeg') singleMjpegUrl.value = url
+        })
+        startMjpegWatchdog(serial)
+      }
+    }, 5000)
+  } else {
+    streamFrozen.value[serial] = false
+    mjpegReconnects.value[serial] = 0
+    streamInfoStatus.value[serial] = isIosDevice(serial) ? 'Loading WDA MJPEG...' : ''
+    singleMjpegUrl.value = mjpegStreamUrl(serial)
+    singleMjpegUrl.value = await resolveMjpegStreamUrl(serial, singleStreamMode.value)
+    startMjpegWatchdog(serial)
+  }
+}
+function stopStream() {
+  if (selectedDevice.value) { rtcStop(selectedDevice.value); stopMjpegWatchdog(selectedDevice.value) }
+  stopH264()
+  singleMjpegUrl.value = ''
+  if (selectedDevice.value) streamInfoStatus.value[selectedDevice.value] = ''
+  streaming.value = false
+}
+
+/* ── MJPEG tap/swipe (uses naturalWidth/Height for coordinate scaling) ─ */
+function mjpegImageLoaded(serial: string) {
+  streamFrozen.value[serial] = false
+  blackWarning.value[serial] = false
+  if (streamInfoStatus.value[serial]?.startsWith('Loading ')) streamInfoStatus.value[serial] = ''
+  if (isIosDevice(serial)) rtcStatus.value[serial] = 'WDA MJPEG'
+}
+
+function mjpegImageError(serial: string) {
+  streamFrozen.value[serial] = true
+  streamInfoStatus.value[serial] = isIosDevice(serial)
+    ? 'WDA MJPEG failed — reconnecting…'
+    : 'MJPEG stream failed — reconnecting…'
+  // Hard error → reconnect right away (backoff-limited by the watchdog).
+  reconnectMjpeg(serial)
+}
+
+/* ── MJPEG stall watchdog ─────────────────────────────────────────────────
+ * An <img> streaming multipart-JPEG holds its LAST frame forever if the
+ * connection silently stalls — no 'error' event fires, so health stays green
+ * while the picture is frozen. Sample the frame to a tiny canvas every few
+ * seconds; if it hasn't changed for a while, force a reconnect (cache-busted
+ * src reload). Reconnecting a genuinely-static screen is harmless. */
+const mjpegWatchTimers = ref<Record<string, number>>({})
+const mjpegLastHash = ref<Record<string, string>>({})
+const mjpegStaleCount = ref<Record<string, number>>({})
+const mjpegReconnects = ref<Record<string, number>>({})
+const MJPEG_STALL_CHECKS = 3          // ~3 * 2.5s = ~7.5s frozen → reconnect
+const MJPEG_MAX_RECONNECTS = 20       // safety cap; reset on any fresh frame
+
+function mjpegFrameHash(serial: string): string | null {
+  const img = document.getElementById(`mjpeg-img-${serial}`) as HTMLImageElement | null
+  if (!img || !img.naturalWidth) return null
+  try {
+    const c = document.createElement('canvas')
+    c.width = 16; c.height = 16
+    const ctx = c.getContext('2d')!
+    ctx.drawImage(img, 0, 0, 16, 16)
+    const d = ctx.getImageData(0, 0, 16, 16).data
+    let h = 0
+    for (let i = 0; i < d.length; i += 4) h = (h * 31 + (d[i]! + d[i+1]! * 3 + d[i+2]! * 7)) | 0
+    return String(h)
+  } catch { return null }  // tainted canvas etc. → skip (don't false-reconnect)
+}
+
+function reconnectMjpeg(serial: string) {
+  if ((mjpegReconnects.value[serial] || 0) >= MJPEG_MAX_RECONNECTS) return
+  mjpegReconnects.value[serial] = (mjpegReconnects.value[serial] || 0) + 1
+  mjpegStaleCount.value[serial] = 0
+  const base = mjpegStreamUrl(serial)
+  const sep = base.includes('?') ? '&' : '?'
+  // New URL forces the <img> to drop the dead connection and open a fresh one.
+  const url = `${base}${sep}_r=${mjpegReconnects.value[serial]}`
+  // Route to whichever view is showing this device (multi grid vs single panel).
+  if (multiStreaming.value[serial]) mjpegUrls.value[serial] = url
+  else singleMjpegUrl.value = url
+}
+
+function startMjpegWatchdog(serial: string) {
+  stopMjpegWatchdog(serial)
+  mjpegLastHash.value[serial] = ''
+  mjpegStaleCount.value[serial] = 0
+  mjpegWatchTimers.value[serial] = window.setInterval(() => {
+    // Active if this device is streaming MJPEG in either the single panel or the grid.
+    const singleActive = streaming.value && selectedDevice.value === serial && singleStreamMode.value === 'mjpeg'
+    const multiActive = multiStreaming.value[serial] && multiStreamMode.value[serial] === 'mjpeg'
+    if (!singleActive && !multiActive) return
+    const hash = mjpegFrameHash(serial)
+    if (hash == null) return
+    if (hash === mjpegLastHash.value[serial]) {
+      mjpegStaleCount.value[serial] = (mjpegStaleCount.value[serial] || 0) + 1
+      if (mjpegStaleCount.value[serial] >= MJPEG_STALL_CHECKS) {
+        streamInfoStatus.value[serial] = 'Stream stalled — reconnecting…'
+        reconnectMjpeg(serial)
+      }
+    } else {
+      mjpegLastHash.value[serial] = hash
+      mjpegStaleCount.value[serial] = 0
+      mjpegReconnects.value[serial] = 0   // healthy frames → reset backoff
+      streamFrozen.value[serial] = false
+    }
+  }, 2500)
+}
+
+function stopMjpegWatchdog(serial: string) {
+  if (mjpegWatchTimers.value[serial]) { clearInterval(mjpegWatchTimers.value[serial]); delete mjpegWatchTimers.value[serial] }
+}
+
+function mjpegImagePoint(img: HTMLImageElement | HTMLCanvasElement, clientX: number, clientY: number): { x: number; y: number; width: number; height: number } | null {
+  const rect = img.getBoundingClientRect()
+  // <img> exposes naturalWidth/Height; <canvas> (H.264) exposes width/height.
+  const sw = (img as HTMLImageElement).naturalWidth || (img as HTMLCanvasElement).width
+  const sh = (img as HTMLImageElement).naturalHeight || (img as HTMLCanvasElement).height
+  if (!sw || !sh || !rect.width || !rect.height) return null
+  const sx = sw / rect.width
+  const sy = sh / rect.height
+  return {
+    x: Math.round((clientX - rect.left) * sx),
+    y: Math.round((clientY - rect.top) * sy),
+    width: sw,
+    height: sh,
+  }
+}
+
+function mjpegMouseDown(serial: string, e: MouseEvent) {
+  e.preventDefault()
+  const img = e.target as HTMLImageElement
+  const point = mjpegImagePoint(img, e.clientX, e.clientY)
+  if (!point) return
+  dragState.value[serial] = { x: point.x, y: point.y, t: Date.now() }
+  dragMoved.value[serial] = false
+}
+
+function mjpegMove(serial: string) {
+  if (dragState.value[serial]) dragMoved.value[serial] = true
+}
+
+function mjpegMouseUp(serial: string, e: MouseEvent) {
+  const ds = dragState.value[serial]; if (!ds) return; e.preventDefault()
+  const img = e.target as HTMLImageElement
+  const point = mjpegImagePoint(img, e.clientX, e.clientY)
+  if (!point) { dragState.value[serial] = null; return }
+  const dx = point.x - ds.x, dy = point.y - ds.y, dist = Math.sqrt(dx * dx + dy * dy)
+  if (!dragMoved.value[serial] || dist < 20) {
+    api('/api/phone/tap', { method: 'POST', body: JSON.stringify({ device: serial, x: point.x, y: point.y, stream_w: point.width, stream_h: point.height }) })
+  } else {
+    api('/api/phone/swipe', { method: 'POST', body: JSON.stringify({ device: serial, x1: ds.x, y1: ds.y, x2: point.x, y2: point.y, stream_w: point.width, stream_h: point.height }) })
+  }
+  dragState.value[serial] = null
+}
+
+function mjpegTouchStart(serial: string, e: TouchEvent) {
+  if (!e.touches.length) return
+  e.preventDefault()
+  const touch = e.touches[0]
+  if (!touch) return
+  const point = mjpegImagePoint(e.target as HTMLImageElement, touch.clientX, touch.clientY)
+  if (!point) return
+  dragState.value[serial] = { x: point.x, y: point.y, t: Date.now() }
+  dragMoved.value[serial] = false
+}
+
+function mjpegTouchMove(serial: string, e: TouchEvent) {
+  if (!dragState.value[serial]) return
+  e.preventDefault()
+  dragMoved.value[serial] = true
+}
+
+function mjpegTouchEnd(serial: string, e: TouchEvent) {
+  const ds = dragState.value[serial]
+  if (!ds) return
+  e.preventDefault()
+  const touch = e.changedTouches[0]
+  if (!touch) { dragState.value[serial] = null; return }
+  const point = mjpegImagePoint(e.target as HTMLImageElement, touch.clientX, touch.clientY)
+  if (!point) { dragState.value[serial] = null; return }
+  const dx = point.x - ds.x, dy = point.y - ds.y, dist = Math.sqrt(dx * dx + dy * dy)
+  if (!dragMoved.value[serial] || dist < 20) {
+    api('/api/phone/tap', { method: 'POST', body: JSON.stringify({ device: serial, x: point.x, y: point.y, stream_w: point.width, stream_h: point.height }) })
+  } else {
+    api('/api/phone/swipe', { method: 'POST', body: JSON.stringify({ device: serial, x1: ds.x, y1: ds.y, x2: point.x, y2: point.y, stream_w: point.width, stream_h: point.height }) })
+  }
+  dragState.value[serial] = null
+}
+
+function mjpegTouchCancel(serial: string) { dragState.value[serial] = null }
+
+/* ── per-device logs ─────────────────────────────────────────────────── */
+const multiLogs = ref<Record<string, string[]>>({})
+async function pollMultiLogs() {
+  for (const d of devices.value) {
+    try {
+      const resp = await api(`/api/logs?device=${d.serial}&limit=30`)
+      const lines = (resp.lines || []).map((l: any) => `[${l.level}] ${l.msg}`)
+      multiLogs.value[d.serial] = lines
+    } catch { if (!multiLogs.value[d.serial]) multiLogs.value[d.serial] = [] }
+  }
+}
+
+/* ── device health ──────────────────────────────────────────────────── */
+const healthData = ref<Record<string, any>>({})
+const healthLoading = ref<Record<string, boolean>>({})
+const healthFixStatus = ref<Record<string, string>>({})
+const showRecoveryDetails = ref<Record<string, boolean>>({})
+function toggleRecoveryDetails(serial: string) {
+  showRecoveryDetails.value[serial] = !showRecoveryDetails.value[serial]
+}
+const showWirelessModal = ref(false)
+const wirelessIp = ref('')
+const wirelessPort = ref('5555')
+const wirelessCode = ref('')
+const wirelessResult = ref('')
+const IOS_AUTO_FIXES = new Set(['start_appium', 'reset_session', 'appium_session', 'wda_session', 'restart_remote_xpc_tunnel'])
+
+// Auto-reset a stale WDA session without the user clicking. Only for session
+// resets (not the heavier tunnel restart), one attempt per distinct dead
+// session, capped so a persistently broken device can't loop (Reset WDA stays
+// available manually). The guard clears once the device is healthy again.
+const AUTO_RESET_ACTIONS = new Set(['reset_session', 'appium_session', 'wda_session'])
+const autoResetGuard = ref<Record<string, { key: string; attempts: number }>>({})
+
+function maybeAutoReset(serial: string) {
+  const h = healthData.value[serial]
+  if (!h) return
+  const state = String(h?.connection?.status || h?.appium?.state || '')
+  if (['available', 'ready', 'connected', 'online'].includes(state)) {
+    delete autoResetGuard.value[serial]
+    return
+  }
+  const action = iosRecoveryAction(serial)
+  if (!AUTO_RESET_ACTIONS.has(action) || !iosRecoveryCanApplyFix(serial) || iosRecoveryFixBusy(serial)) return
+  const key = String(h?.wda?.session || h?.appium?.session_id || state)
+  const g = autoResetGuard.value[serial]
+  if (g && g.key === key) return
+  const attempts = (g?.attempts || 0) + 1
+  if (attempts > 2) return
+  autoResetGuard.value[serial] = { key, attempts }
+  healthFixStatus.value[serial] = 'Auto-resetting WDA…'
+  fixIssue(serial, action)
+}
+
+async function loadHealth(serial: string) {
+  healthLoading.value[serial] = true
+  try {
+    healthData.value[serial] = await api(`/api/phone/health/${serial}`)
+  } catch { healthData.value[serial] = null }
+  healthLoading.value[serial] = false
+  maybeAutoReset(serial)
+}
+
+async function loadAllHealth() {
+  for (const d of devices.value) loadHealth(d.serial)
+}
+
+function isIosHealthPayload(h: any): boolean {
+  return h?.platform === 'ios' || h?.connection?.type === 'appium-wda'
+}
+
+function iosActiveAppLabel(h: any): string {
+  const active = h?.wda?.active_app || h?.device_info?.active_app || {}
+  return String(active.name || active.bundleId || active.bundle_id || '').trim()
+}
+
+function healthDotColor(c: string): string {
+  return c === 'green' ? '#22c55e' : c === 'yellow' ? '#f59e0b' : c === 'red' ? '#ef4444' : '#475569'
+}
+
+function healthDots(serial: string): string[] {
+  const h = healthData.value[serial]
+  if (!h) return []
+  if (isIosHealthPayload(h)) {
+    const state = h.connection?.status || h.appium?.state || 'session_error'
+    const appiumReachable = h.appium?.reachable === true
+    const sessionOk = state === 'available' || !!h.wda?.session || !!h.appium?.session_id
+    const screenshotOk = h.wda?.screenshot_ok === true || (h.wda?.checks?.screenshot_bytes || 0) > 0
+    const sourceOk = h.wda?.source_ok === true || (h.wda?.checks?.source_bytes || 0) > 0
+    const activeOk = !!iosActiveAppLabel(h)
+    const reachableMissing = appiumReachable ? 'yellow' : 'red'
+    return [
+      appiumReachable ? 'green' : 'red',
+      sessionOk ? 'green' : reachableMissing,
+      screenshotOk ? 'green' : reachableMissing,
+      sourceOk ? 'green' : reachableMissing,
+      activeOk ? 'green' : 'gray',
+    ]
+  }
+  const dots: string[] = []
+  dots.push(h.portal?.http_responding ? 'green' : h.portal?.installed ? 'yellow' : 'red')
+  dots.push(h.wifi?.connected ? 'green' : 'gray')
+  dots.push(h.battery?.level > 20 ? 'green' : h.battery?.level > 5 ? 'yellow' : 'red')
+  dots.push(h.storage?.free_mb > 1000 ? 'green' : h.storage?.free_mb > 500 ? 'yellow' : 'red')
+  dots.push(h.screen_on ? 'green' : 'yellow')
+  return dots
+}
+
+function healthTitle(serial: string): string {
+  const h = healthData.value[serial]
+  if (!h) return ''
+  if (!isIosHealthPayload(h)) return 'Portal / WiFi / Battery / Storage / Screen'
+  const state = h.connection?.status || h.appium?.state || 'unknown'
+  const message = String(h.appium?.message || h.error || '').trim()
+  const activeApp = iosActiveAppLabel(h)
+  const recovery = iosRecovery(serial)
+  const parts = [`Appium / WDA / Screenshot / Source / Active app: ${state}`]
+  if (activeApp) parts.push(`active ${activeApp}`)
+  if (h.recommended_fix) parts.push(`fix ${h.recommended_fix}`)
+  if (recovery?.summary) parts.push(recovery.summary)
+  if (message) parts.push(message)
+  return parts.join(' | ')
+}
+
+function iosRecovery(serial: string): any | null {
+  const h = healthData.value[serial]
+  if (!isIosHealthPayload(h)) return null
+  return h?.recovery || null
+}
+
+function iosRecoveryVisible(serial: string): boolean {
+  // The tunnel/WDA health probe is synchronous and slow (often >10s), so the
+  // dashboard poll times out and the card flashes "remote_xpc_tunnel_unavailable"
+  // even while a live stream is flowing over that exact tunnel — pure noise. The
+  // stream itself is proof the tunnel works. Suppress this recovery card on the
+  // Phone Agent tab entirely; full, honest diagnostics live in the 🩺 Device
+  // Health tab where a stale reading isn't sitting on top of a working stream.
+  void serial
+  return false
+}
+
+function iosRecoveryState(serial: string): string {
+  const h = healthData.value[serial]
+  return String(h?.connection?.status || h?.appium?.state || iosRecovery(serial)?.state || 'unknown')
+}
+
+function iosRecoveryCode(serial: string): string {
+  return String(iosRecovery(serial)?.code || healthData.value[serial]?.recommended_fix || '')
+}
+
+function iosRecoveryAction(serial: string): string {
+  return iosRecoveryCode(serial) || String(healthData.value[serial]?.recommended_fix || '')
+}
+
+function iosRecoveryCanApplyFix(serial: string): boolean {
+  if (!serial || !isIosDevice(serial)) return false
+  const recovery = iosRecovery(serial)
+  if (recovery?.auto_fixable === false || recovery?.manual_action_required === true) return false
+  return IOS_AUTO_FIXES.has(iosRecoveryAction(serial))
+}
+
+function iosRecoveryFixBusy(serial: string): boolean {
+  return healthFixStatus.value[serial]?.startsWith('Applying ') || false
+}
+
+function iosRecoveryActionLabel(serial: string): string {
+  const action = iosRecoveryAction(serial)
+  if (action === 'start_appium') return 'Start Appium'
+  if (action === 'restart_remote_xpc_tunnel') return 'Restart Tunnel'
+  if (action === 'reset_session' || action === 'appium_session' || action === 'wda_session') return 'Reset WDA'
+  return 'Apply Fix'
+}
+
+function iosRecoveryActionTitle(serial: string): string {
+  const action = iosRecoveryAction(serial)
+  const recovery = iosRecovery(serial)
+  if (recovery?.auto_fixable === false || recovery?.manual_action_required === true) return 'Manual recovery is required; copy the recovery commands below'
+  if (action === 'start_appium') return 'Start local Appium when IOS_APPIUM_URL points to localhost'
+  if (action === 'restart_remote_xpc_tunnel') return 'Restart the XCUITest RemoteXPC tunnel when the process is owned by this user'
+  if (action) return `Apply iOS health fix: ${action}`
+  return 'No automatic iOS health fix is available'
+}
+
+function iosRecoverySummary(serial: string): string {
+  return String(iosRecovery(serial)?.summary || healthData.value[serial]?.appium?.message || '')
+}
+
+function iosRecoverySteps(serial: string): string[] {
+  const steps = iosRecovery(serial)?.steps
+  return Array.isArray(steps) ? steps.slice(0, 3).map(step => String(step)) : []
+}
+
+function iosRecoveryCommands(serial: string): string[] {
+  const commands = iosRecovery(serial)?.commands
+  return Array.isArray(commands) ? commands.map(cmd => String(cmd)).filter(Boolean) : []
+}
+
+function iosHealthDetails(serial: string): { label: string; value: string; ok?: boolean }[] {
+  const h = healthData.value[serial]
+  if (!isIosHealthPayload(h)) return []
+  const wda = h?.wda || {}
+  const appium = h?.appium || {}
+  const rows = [
+    { label: 'Appium', value: appium.reachable ? 'reachable' : 'down', ok: appium.reachable === true },
+    { label: 'WDA', value: wda.ready ? 'ready' : String(appium.state || h?.connection?.status || 'not ready'), ok: wda.ready === true },
+    { label: 'Session', value: String(wda.session || appium.session_id || 'none'), ok: !!(wda.session || appium.session_id) },
+    { label: 'Stream', value: String(wda.mjpeg_url || 'WDA MJPEG'), ok: wda.ready === true },
+  ]
+  return rows.filter(row => row.value)
+}
+
+async function copyIosRecoveryCommand(serial: string, command: string) {
+  try {
+    await navigator.clipboard.writeText(command)
+    healthFixStatus.value[serial] = 'Copied recovery command'
+  } catch {
+    healthFixStatus.value[serial] = 'Copy failed'
+  }
+}
+
+async function fixIssue(serial: string, issue: string) {
+  if (!serial || !issue) return
+  healthFixStatus.value[serial] = `Applying ${issue}...`
+  try {
+    const result = await api(`/api/phone/health/${serial}/fix`, { method: 'POST', body: JSON.stringify({ issue }) })
+    if (result.ok) {
+      healthFixStatus.value[serial] = result.message || 'Fix applied'
+    } else if (result.manual_action_required) {
+      healthFixStatus.value[serial] = result.message || 'Manual action required'
+    } else {
+      healthFixStatus.value[serial] = result.error || 'Fix failed'
+    }
+  } catch (error) {
+    healthFixStatus.value[serial] = error instanceof Error ? error.message.replace(/^API \d+:\s*/, '') : 'Fix failed'
+  } finally {
+    await loadHealth(serial)
+  }
+}
+
+async function goWireless(serial: string) {
+  const res = await api('/api/phone/wireless/enable', { method: 'POST', body: JSON.stringify({ device: serial }) })
+  if (res.ok) statusText.value = `WiFi enabled: ${res.wifi_ip}:${res.wifi_port}`
+  else statusText.value = res.error || 'WiFi enable failed'
+  await loadDevices()
+}
+
+async function wirelessConnect() {
+  wirelessResult.value = 'Connecting...'
+  const res = wirelessCode.value
+    ? await api('/api/phone/wireless/pair', { method: 'POST', body: JSON.stringify({ ip: wirelessIp.value, port: parseInt(wirelessPort.value), code: wirelessCode.value }) })
+    : await api('/api/phone/wireless/connect', { method: 'POST', body: JSON.stringify({ ip: wirelessIp.value, port: parseInt(wirelessPort.value) }) })
+  wirelessResult.value = res.ok ? `Connected: ${res.device_serial || wirelessIp.value}` : (res.error || 'Failed')
+  if (res.ok) { showWirelessModal.value = false; await loadDevices() }
+}
+
+/* ── agent chat ─────────────────────────────────────────────────────── */
+const chatMessages = ref<{role: string; content: string; tool_name?: string; tool_args?: any; image?: string}[]>([])
+const chatInput = ref('')
+const chatSending = ref(false)
+const chatSessionId = ref('')
+let chatAbortController: AbortController | null = null
+let chatStopRequested = false
+const chatTokens = ref(0)
+const chatActivity = ref('')  // brief status during thinking
+const chatVerbose = ref(false) // show tool calls inline in chat
+
+/* ── voice commands ─────────────────────────────────────────────────── */
+const isListening = ref(false)
+const isContinuousVoice = ref(false)
+const voiceSpeakerEnabled = ref(true)
+type BrowserSpeechRecognition = {
+  continuous: boolean
+  lang: string
+  interimResults: boolean
+  maxAlternatives: number
+  onstart: (() => void) | null
+  onresult: ((event: SpeechRecognitionEvent) => void) | null
+  onerror: ((event: { error?: string }) => void) | null
+  onend: (() => void) | null
+  start: () => void
+  stop: () => void
+}
+let recognitionInstance: BrowserSpeechRecognition | null = null
+
+function speakText(text: string) {
+  if (!voiceSpeakerEnabled.value) return
+  if (!window.speechSynthesis) return
+
+  // Cancel any ongoing speech
+  window.speechSynthesis.cancel()
+
+  // Clean the text from markdown, emojis, code blocks, etc.
+  const cleanText = text
+    .replace(/```[\s\S]*?```/g, '') // remove code blocks
+    .replace(/\[[\s\S]*?\]/g, '')  // remove brackets
+    .replace(/[*_#`~]/g, '')       // remove markdown characters
+    .trim()
+
+  if (!cleanText) {
+    if (isContinuousVoice.value) {
+      setTimeout(() => startVoiceRecognition(), 500)
+    }
+    return
+  }
+
+  const utterance = new SpeechSynthesisUtterance(cleanText)
+  
+  // Set voice
+  const voices = window.speechSynthesis.getVoices()
+  const preferredVoice = voices.find(v => v.lang.startsWith('en') && v.name.toLowerCase().includes('google'))
+    || voices.find(v => v.lang.startsWith('en'))
+  if (preferredVoice) utterance.voice = preferredVoice
+
+  utterance.onend = () => {
+    if (isContinuousVoice.value) {
+      setTimeout(() => startVoiceRecognition(), 500)
+    }
+  }
+
+  utterance.onerror = () => {
+    if (isContinuousVoice.value) {
+      setTimeout(() => startVoiceRecognition(), 500)
+    }
+  }
+
+  window.speechSynthesis.speak(utterance)
+}
+
+function startVoiceRecognition() {
+  const speechWindow = window as Window & {
+    SpeechRecognition?: new () => BrowserSpeechRecognition
+    webkitSpeechRecognition?: new () => BrowserSpeechRecognition
+  }
+  const SpeechRecognition = speechWindow.SpeechRecognition || speechWindow.webkitSpeechRecognition
+  if (!SpeechRecognition) {
+    alert("Speech recognition is not supported in this browser. Please use Chrome/Edge.")
+    return
+  }
+
+  if (isListening.value) {
+    if (recognitionInstance) {
+      recognitionInstance.stop()
+    }
+    isListening.value = false
+    return
+  }
+
+  const rec = new SpeechRecognition()
+  rec.continuous = false
+  rec.lang = 'en-US'
+  rec.interimResults = false
+  rec.maxAlternatives = 1
+
+  rec.onstart = () => {
+    isListening.value = true
+  }
+
+  rec.onresult = (event) => {
+    const speechToText = event.results[0]?.[0]?.transcript || ''
+    chatInput.value = speechToText
+  }
+
+  rec.onerror = (event) => {
+    console.error("Speech recognition error:", event.error)
+    isListening.value = false
+  }
+
+  rec.onend = () => {
+    isListening.value = false
+    if (chatInput.value.trim()) {
+      chatSend()
+    } else if (isContinuousVoice.value) {
+      // If nothing was said, retry listening in continuous mode
+      setTimeout(() => startVoiceRecognition(), 1000)
+    }
+  }
+
+  recognitionInstance = rec
+  rec.start()
+}
+
+function toggleContinuousVoice() {
+  if (!selectedDevice.value) return
+  isContinuousVoice.value = !isContinuousVoice.value
+  
+  if (isContinuousVoice.value) {
+    voiceSpeakerEnabled.value = true
+    if (isListening.value && recognitionInstance) {
+      recognitionInstance.stop()
+    }
+    startVoiceRecognition()
+  } else {
+    if (recognitionInstance) {
+      recognitionInstance.stop()
+    }
+    if (window.speechSynthesis) {
+      window.speechSynthesis.cancel()
+    }
+    isListening.value = false
+  }
+}
+
+
+
+/* ── Save conversation as skill ──────────────────────────────────────── */
+const saveSkillModal = ref(false)
+const saveSkillKind = ref<'hard' | 'soft'>('hard')
+const saveSkillName = ref('')
+const saveSkillPackage = ref('')
+const saveSkillDesc = ref('')
+const saveSkillSteps = ref('')      // editable pretty-printed JSON of recorded steps
+const saveSkillGuidance = ref('')   // markdown for soft skills
+const saveSkillSummary = ref('')    // draft summary from backend
+const saveSkillLoading = ref(false) // draft fetch in flight
+const saveSkillSaving = ref(false)  // save in flight
+const saveSkillError = ref('')
+
+function openSaveSkillModal() {
+  if (!chatSessionId.value) return
+  saveSkillKind.value = 'hard'
+  saveSkillName.value = ''
+  saveSkillPackage.value = ''
+  saveSkillDesc.value = ''
+  saveSkillSteps.value = ''
+  saveSkillGuidance.value = ''
+  saveSkillSummary.value = ''
+  saveSkillError.value = ''
+  saveSkillModal.value = true
+  loadDraftSteps()
+}
+
+function setSaveSkillKind(k: 'hard' | 'soft') {
+  saveSkillKind.value = k
+  if (k === 'hard' && !saveSkillSteps.value && chatSessionId.value) loadDraftSteps()
+}
+
+async function loadDraftSteps() {
+  if (!chatSessionId.value) return
+  saveSkillLoading.value = true
+  saveSkillError.value = ''
+  try {
+    const resp = await fetch('/api/skills/draft-from-chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conversation_id: chatSessionId.value }),
+    })
+    if (!resp.ok) throw new Error(await resp.text())
+    const data = await resp.json()
+    saveSkillSummary.value = data.summary || ''
+    saveSkillSteps.value = JSON.stringify(data.steps || [], null, 2)
+    if (data.app_package && !saveSkillPackage.value) saveSkillPackage.value = data.app_package
+  } catch (e: any) {
+    saveSkillError.value = 'Failed to load steps: ' + e.message
+  } finally {
+    saveSkillLoading.value = false
+  }
+}
+
+async function saveSkillFromChat() {
+  saveSkillError.value = ''
+  if (!saveSkillName.value.trim()) { saveSkillError.value = 'Name is required.'; return }
+  const body: any = {
+    conversation_id: chatSessionId.value || undefined,
+    kind: saveSkillKind.value,
+    name: saveSkillName.value.trim(),
+    app_package: saveSkillPackage.value.trim() || undefined,
+    description: saveSkillDesc.value.trim() || undefined,
+  }
+  if (saveSkillKind.value === 'hard') {
+    try { body.steps = JSON.parse(saveSkillSteps.value || '[]') }
+    catch (e: any) { saveSkillError.value = 'Steps must be valid JSON: ' + e.message; return }
+  } else {
+    body.guidance = saveSkillGuidance.value
+  }
+  saveSkillSaving.value = true
+  try {
+    const resp = await fetch('/api/skills/save-from-chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    if (!resp.ok) throw new Error(await resp.text())
+    const data = await resp.json()
+    statusText.value = data.message || 'Skill saved.'
+    saveSkillModal.value = false
+  } catch (e: any) {
+    saveSkillError.value = 'Save failed: ' + e.message
+  } finally {
+    saveSkillSaving.value = false
+  }
+}
+
+// Markdown rendering
+function renderMd(text: string): string {
+  const w = window as any
+  if (w.marked) return w.marked.parse(text)
+  return text.replace(/\n/g, '<br>')
+}
+// Load marked.js
+if (!(window as any).marked) {
+  const s = document.createElement('script')
+  s.src = 'https://cdn.jsdelivr.net/npm/marked/marked.min.js'
+  document.head.appendChild(s)
+}
+// Keep the menu focused on the providers used by this installation: local
+// Ollama for phone automation and Grok for normal text chat.
+const chatProvider = ref('ollama')
+const chatModel = ref(localStorage.getItem('agent_model') || 'qwen3:8b')
+const CHAT_PROVIDERS = ref([
+  { id: 'ollama', label: 'Ollama (local)', models: [] },
+  { id: 'grok', label: 'Grok chat (Groq API)', models: ['llama-3.3-70b-versatile'] },
+])
+
+async function fetchProviders() {
+  try {
+    const resp = await fetch('/api/agent-chat/providers')
+    if (resp.ok) {
+      const providers = await resp.json()
+      CHAT_PROVIDERS.value = providers.filter((p: any) => ['ollama', 'grok'].includes(p.id))
+    }
+  } catch {}
+  const savedProvider = localStorage.getItem('agent_provider') || ''
+  chatProvider.value = CHAT_PROVIDERS.value.some((p: any) => p.id === savedProvider)
+    ? savedProvider!
+    : 'ollama'
+  const selected = CHAT_PROVIDERS.value.find((p: any) => p.id === chatProvider.value)
+  const selectedModel = selected?.models?.[0]
+  if (selectedModel && !selected.models.includes(chatModel.value)) {
+    chatModel.value = selectedModel
+    localStorage.setItem('agent_model', chatModel.value)
+  }
+  localStorage.setItem('agent_provider', chatProvider.value)
+}
+
+// Ollama model status
+const ollamaModels = ref<Array<{name: string; status: string; vram_gb: number; size_gb: number; parameter_size: string}>>([])
+const ollamaLoading = ref('')  // model name currently loading
+
+async function fetchOllamaStatus() {
+  if (chatProvider.value !== 'ollama') return
+  try {
+    const resp = await fetch('/api/agent-chat/ollama/status')
+    if (resp.ok) {
+      const data = await resp.json()
+      if (data.ok) {
+        ollamaModels.value = data.models
+        if (data.models.length && !data.models.some((m: any) => m.name === chatModel.value)) {
+          chatModel.value = data.models[0].name
+          localStorage.setItem('agent_model', chatModel.value)
+        }
+      }
+    }
+  } catch {}
+}
+
+function ollamaModelStatus(name: string): string {
+  if (ollamaLoading.value === name) return 'loading'
+  const m = ollamaModels.value.find(m => m.name === name)
+  return m?.status || 'unknown'
+}
+
+function ollamaModelVram(name: string): number {
+  const m = ollamaModels.value.find(m => m.name === name)
+  return m?.vram_gb || 0
+}
+
+async function ollamaLoad(model: string) {
+  ollamaLoading.value = model
+  try {
+    const resp = await fetch('/api/agent-chat/ollama/load', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model }),
+    })
+    const data = await resp.json()
+    if (!data.ok) chatMessages.value.push({ role: 'system', content: `Load failed: ${data.error}` })
+  } catch (e: any) {
+    chatMessages.value.push({ role: 'system', content: `Load failed: ${e.message}` })
+  }
+  ollamaLoading.value = ''
+  fetchOllamaStatus()
+}
+
+async function ollamaUnload(model?: string) {
+  const m = model || chatModel.value
+  try {
+    const resp = await fetch('/api/agent-chat/ollama/unload', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: m }),
+    })
+    const data = await resp.json()
+    if (data.ok) chatMessages.value.push({ role: 'system', content: `Unloaded ${m} from VRAM.` })
+    else chatMessages.value.push({ role: 'system', content: `Unload failed: ${data.error}` })
+  } catch (e: any) {
+    chatMessages.value.push({ role: 'system', content: `Failed to unload: ${e.message}` })
+  }
+  fetchOllamaStatus()
+}
+
+const ollamaPullName = ref('')
+const ollamaPulling = ref(false)
+
+async function ollamaPull() {
+  const model = ollamaPullName.value.trim()
+  if (!model) return
+  ollamaPulling.value = true
+  chatMessages.value.push({ role: 'system', content: `Pulling ${model}...` })
+  try {
+    const resp = await fetch('/api/agent-chat/ollama/pull', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model }),
+    })
+    const data = await resp.json()
+    if (data.ok) {
+      chatMessages.value.push({ role: 'system', content: `${model} pulled successfully.` })
+      ollamaPullName.value = ''
+      fetchProviders()
+      fetchOllamaStatus()
+    } else {
+      chatMessages.value.push({ role: 'system', content: `Pull failed: ${data.error}` })
+    }
+  } catch (e: any) {
+    chatMessages.value.push({ role: 'system', content: `Pull failed: ${e.message}` })
+  }
+  ollamaPulling.value = false
+}
+
+const chatConversations = ref<{id: string; title: string; provider: string; model: string; message_count: number; updated_at: string}[]>([])
+
+// The agent can create several short-lived sessions while a request is being
+// started/stopped. Those sessions often share the same generated title, which
+// makes the native conversation select unusable. Keep the newest row for each
+// identical title, while always retaining the conversation currently open.
+const visibleChatConversations = computed(() => {
+  const currentId = chatSessionId.value
+  const seen = new Set<string>()
+  const visible: typeof chatConversations.value = []
+
+  for (const conversation of chatConversations.value) {
+    const key = [
+      conversation.title?.trim() || 'Untitled',
+      conversation.provider,
+      conversation.model,
+    ].join('|')
+
+    if (conversation.id === currentId || !seen.has(key)) {
+      visible.push(conversation)
+      seen.add(key)
+    }
+  }
+
+  return visible
+})
+
+async function loadConversations() {
+  if (!selectedDevice.value) return
+  try {
+    const resp = await fetch(`/api/agent-chat/conversations?device=${selectedDevice.value}`)
+    chatConversations.value = await resp.json()
+  } catch { chatConversations.value = [] }
+}
+
+async function resumeConversation(cid: string) {
+  try {
+    const resp = await fetch(`/api/agent-chat/conversation/${cid}/resume`, { method: 'POST' })
+    const data = await resp.json()
+    if (data.ok) {
+      chatSessionId.value = data.session_id
+      chatProvider.value = data.provider || chatProvider.value
+      chatModel.value = data.model || chatModel.value
+      chatMessages.value = (data.messages || []).map((m: any) => ({
+        role: m.role, content: m.content, tool_name: m.tool_name, tool_args: m.tool_args
+      }))
+      await nextTick()
+      const el = document.getElementById('agent-chat-scroll')
+      if (el) el.scrollTop = el.scrollHeight
+    }
+  } catch (e: any) { console.error('resume failed', e) }
+}
+
+async function deleteConversation(cid: string) {
+  try { await fetch(`/api/agent-chat/conversation/${cid}`, { method: 'DELETE' }) } catch {}
+  await loadConversations()
+  if (chatSessionId.value === cid) chatClear()
+}
+
+function onProviderChange() {
+  localStorage.setItem('agent_provider', chatProvider.value)
+  const p = CHAT_PROVIDERS.value.find(p => p.id === chatProvider.value)
+  const firstModel = p?.models?.[0]
+  if (firstModel) { chatModel.value = firstModel; localStorage.setItem('agent_model', chatModel.value) }
+  chatSessionId.value = '' // reset session on provider change
+  if (chatProvider.value === 'ollama') fetchOllamaStatus()
+}
+function onModelChange() { localStorage.setItem('agent_model', chatModel.value); chatSessionId.value = '' }
+
+async function chatSend() {
+  if (!chatInput.value.trim() || chatSending.value || !selectedDevice.value) return
+  const msg = chatInput.value.trim()
+  chatInput.value = ''
+  chatMessages.value.push({ role: 'user', content: msg })
+  chatSending.value = true
+  chatStopRequested = false
+  chatActivity.value = 'Reading screen...'
+  chatTokens.value += msg.length / 4  // rough estimate
+  // Auto-start stream
+  if (!streaming.value) { singleStreamMode.value = 'mjpeg'; startStream() }
+
+  try {
+    chatAbortController = new AbortController()
+    const body: any = { content: msg, device: selectedDevice.value, provider: chatProvider.value, model: chatModel.value }
+    if (chatSessionId.value) body.session_id = chatSessionId.value
+    const resp = await fetch('/api/agent-chat/message', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: chatAbortController.signal,
+    })
+    if (!resp.ok) {
+      const rawDetail = await resp.text()
+      let detail = rawDetail
+      try { detail = JSON.parse(rawDetail).detail || rawDetail } catch {}
+      throw new Error(detail || `Agent request failed (${resp.status})`)
+    }
+    const reader = resp.body?.getReader()
+    if (!reader) throw new Error('Agent returned an empty response stream')
+    const decoder = new TextDecoder()
+    let buffer = ''
+    let currentText = ''
+
+    while (reader) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || ''
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue
+        try {
+          const event = JSON.parse(line.slice(6))
+          if (event.type === 'session' && event.session_id) {
+            chatSessionId.value = event.session_id
+          } else if (event.type === 'text') {
+            chatActivity.value = ''
+            // Check if last message is assistant — append to it. Otherwise start new.
+            const last = chatMessages.value[chatMessages.value.length - 1]
+            if (last?.role === 'assistant') {
+              last.content += event.content
+            } else {
+              chatMessages.value.push({ role: 'assistant', content: event.content })
+            }
+          } else if (event.type === 'tool_call') {
+            const TOOL_EMOJI: Record<string, string> = {
+              screenshot: '📸', get_screen_tree: '🌳', get_elements: '🔍', tap: '👆', tap_element: '👆',
+              swipe: '👋', type_text: '⌨️', press_key: '🔘', launch_app: '🚀', force_stop: '⛔',
+              ocr_screen: '🔤', find_on_screen: '🔎', classify_screen: '📋', get_phone_state: '📱',
+              shell: '💻', list_packages: '📦', clipboard_get: '📋', clipboard_set: '📋', list_skills: '🧩', run_skill: '⚡',
+              long_press: '✊', open_notifications: '🔔', get_notifications: '🔔', wait: '⏳',
+            }
+            const SHORT_NAME: Record<string, string> = {
+              get_screen_tree: 'tree', get_elements: 'elements', get_phone_state: 'state',
+              screenshot_annotated: 'annotated ss', screenshot_cropped: 'crop ss',
+              find_on_screen: 'find', classify_screen: 'classify', ocr_screen: 'OCR',
+              ocr_region: 'OCR region', list_packages: 'packages', list_skills: 'skills',
+              launch_app: 'launch', force_stop: 'stop', type_text: 'type', press_key: 'key',
+              tap_element: 'tap #', long_press: 'hold', open_notifications: 'notifs',
+              get_notifications: 'notifs', clipboard_get: 'clip', clipboard_set: 'clip set',
+              run_skill: 'skill', screenshot: 'screenshot',
+            }
+            const emoji = TOOL_EMOJI[event.name] || '🔧'
+            const short = SHORT_NAME[event.name] || event.name
+            chatActivity.value = `${emoji} ${short}...`
+            if (chatVerbose.value) {
+              chatMessages.value.push({ role: 'tool_call', content: `${emoji} ${event.name}(${JSON.stringify(event.args).slice(0, 120)})`, tool_name: event.name, tool_args: event.args })
+            } else {
+              // Brief: just emoji, or emoji + key info
+              let brief = `${emoji} ${short}`
+              const a = event.args || {}
+              if (event.name === 'tap' && a.x) brief = `${emoji} (${a.x},${a.y})`
+              else if (event.name === 'type_text' && a.text) brief = `${emoji} "${a.text.slice(0, 20)}"`
+              else if (event.name === 'launch_app' && a.package) brief = `${emoji} ${a.package.split('.').pop()}`
+              else if (event.name === 'press_key' && a.key) brief = `${emoji} ${a.key.replace('KEYCODE_', '')}`
+              else if (event.name === 'swipe') brief = `${emoji} swipe`
+              else if (event.name === 'shell' && a.command) brief = `${emoji} $ ${a.command.slice(0, 25)}`
+              chatMessages.value.push({ role: 'tool_call', content: brief, tool_name: event.name })
+            }
+          } else if (event.type === 'tool_result') {
+            chatActivity.value = '🤔 Thinking...'
+            if (chatVerbose.value) {
+              chatMessages.value.push({ role: 'tool_result', content: event.result?.slice(0, 300) || '', tool_name: event.name })
+            }
+          } else if (event.type === 'activity') {
+            chatActivity.value = event.content || 'Working...'
+          } else if (event.type === 'tokens') {
+            // Real token count from Claude Code
+            chatTokens.value = (event.input || 0) + (event.output || 0)
+            if (event.cost) chatActivity.value = `💰 $${event.cost.toFixed(4)}`
+          } else if (event.type === 'screenshot') {
+            chatMessages.value.push({ role: 'screenshot', content: '', image: event.image })
+          } else if (event.type === 'error') {
+            chatMessages.value.push({ role: 'error', content: event.content })
+            chatActivity.value = ''
+          } else if (event.type === 'done') {
+            currentText = ''
+            chatActivity.value = ''
+            const assistantMsgs = chatMessages.value.filter(m => m.role === 'assistant')
+            if (assistantMsgs.length > 0) {
+              const lastReply = assistantMsgs[assistantMsgs.length - 1]?.content
+              if (lastReply) speakText(lastReply)
+            }
+          }
+          // Auto-scroll
+          const el = document.getElementById('agent-chat-scroll')
+          if (el) el.scrollTop = el.scrollHeight
+        } catch {}
+      }
+    }
+  } catch (e: any) {
+    // Aborting fetch is the expected result of pressing Stop. Browsers often
+    // report it as “BodyStreamBuffer was aborted”; do not show that as an
+    // agent failure because chatStop already adds the user-facing status.
+    if (!chatStopRequested && e?.name !== 'AbortError') {
+      chatMessages.value.push({ role: 'error', content: e.message || 'Agent request failed' })
+    }
+  }
+  chatSending.value = false
+  chatAbortController = null
+  chatStopRequested = false
+  loadConversations()  // refresh conversation list after each turn
+}
+
+function chatStop() {
+  chatStopRequested = true
+  if (chatAbortController) { chatAbortController.abort(); chatAbortController = null }
+  // Kill the backend subprocess too
+  if (chatSessionId.value) {
+    fetch(`/api/agent-chat/stop/${chatSessionId.value}`, { method: 'POST' }).catch(() => {})
+  }
+  // Also stop by device in case the stream was interrupted before its session
+  // id reached the browser, or another tab owns the active task.
+  if (selectedDevice.value) {
+    fetch(`/api/agent-chat/stop-device/${selectedDevice.value}`, { method: 'POST' }).catch(() => {})
+  }
+  chatSending.value = false
+  chatActivity.value = ''
+  chatMessages.value.push({ role: 'error', content: 'Stopped by user' })
+}
+
+function chatClear() {
+  // Starting a new chat, changing devices, or pressing Clear must also stop
+  // the in-flight request. Otherwise the old stream keeps controlling the
+  // phone while the UI appears empty and ready for a new task.
+  if (chatSending.value) {
+    chatStopRequested = true
+    if (chatAbortController) { chatAbortController.abort(); chatAbortController = null }
+    if (chatSessionId.value) {
+      fetch(`/api/agent-chat/stop/${chatSessionId.value}`, { method: 'POST' }).catch(() => {})
+    }
+    if (selectedDevice.value) {
+      fetch(`/api/agent-chat/stop-device/${selectedDevice.value}`, { method: 'POST' }).catch(() => {})
+    }
+    chatSending.value = false
+  }
+  chatMessages.value = []
+  chatSessionId.value = ''
+  chatTokens.value = 0
+  chatActivity.value = ''
+}
+
+/* ── general ─────────────────────────────────────────────────────────── */
+async function loadDevices() {
+  try {
+    const resp = await api('/api/phone/devices')
+    devices.value = resp.devices || resp || []
+    if (devices.value.length && !selectedDevice.value) selectedDevice.value = devices.value[0].serial
+    statusText.value = devices.value.length ? `${devices.value.length} device(s)` : 'No devices'
+    refreshAllRecordingStatus()
+  } catch (e: any) { statusText.value = e.message || 'Device load error' }
+}
+
+function updateNicknameRow() {
+  const dev = devices.value.find(d => d.serial === selectedDevice.value)
+  nickname.value = dev?.nickname || ''
+}
+
+async function saveNickname() {
+  await api('/api/phone/nickname', { method: 'POST', body: JSON.stringify({ serial: selectedDevice.value, nickname: nickname.value }) })
+  statusText.value = 'Nickname saved'
+  await loadDevices()
+}
+
+async function pollLogs() {
+  try {
+    const resp = await api(`/api/logs?from=${srvSeq}&limit=50`)
+    if (resp.lines?.length) {
+      srvLogs.value.push(...resp.lines.map((l: any) => `[${l.level}] ${l.msg}`))
+      srvSeq += resp.lines.length
+      if (srvLogs.value.length > 200) srvLogs.value = srvLogs.value.slice(-100)
+    }
+  } catch {}
+}
+
+let multiLogTimer: number | null = null
+
+onMounted(async () => {
+  await loadDevices()
+  loadAllHealth()
+  loadConversations()
+  fetchProviders()
+  fetchOllamaStatus()
+  logTimer = window.setInterval(pollLogs, 3000)
+  multiLogTimer = window.setInterval(pollMultiLogs, 4000)
+  pollMultiLogs()
+})
+watch(selectedDevice, () => {
+  loadConversations()
+  chatClear()
+  refreshRecordingStatus(selectedDevice.value)
+})
+onUnmounted(() => {
+  // Clean up all RTC sessions
+  for (const serial of Object.keys(rtcSessions.value)) rtcStop(serial)
+  if (logTimer) clearInterval(logTimer)
+  if (multiLogTimer) clearInterval(multiLogTimer)
+})
+</script>
+
+<template>
+  <div class="phone-admin">
+    <!-- Tab bar -->
+    <div class="tab-bar">
+      <div class="tab-group">
+        <button class="tab-btn" :class="{ active: subTab === 'single' }" @click="subTab = 'single'">Single Device</button>
+        <button class="tab-btn" :class="{ active: subTab === 'multi' }" @click="subTab = 'multi'">Multi Device</button>
+      </div>
+      <span class="status-text">{{ statusText }}</span>
+    </div>
+
+    <!-- ═══════════════ Single Device ═══════════════ -->
+    <div v-if="subTab === 'single'" class="single-layout">
+      <!-- LEFT: Agent Chat -->
+      <div style="display: flex; flex-direction: column; min-width: 0; background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px; overflow: hidden">
+        <!-- Chat header -->
+        <div style="padding: 6px 12px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 6px; flex-shrink: 0; flex-wrap: wrap">
+          <span style="width: 6px; height: 6px; border-radius: 50%"
+            :style="{ background: chatSending ? '#f59e0b' : chatMessages.length ? '#22c55e' : '#475569' }"></span>
+          <span style="font-size: 11px; font-weight: 600; color: var(--text-2)">Agent</span>
+          <!-- Conversation picker -->
+          <select @change="(e: any) => { if (e.target.value === '__new__') chatClear(); else resumeConversation(e.target.value); e.target.value = chatSessionId || '__new__'; }"
+            style="font-size: 10px; padding: 2px 6px; background: var(--bg-deep); border: 1px solid var(--border); border-radius: 4px; color: var(--text-3); max-width: 130px">
+            <option value="__new__">+ New chat</option>
+            <option v-for="c in visibleChatConversations" :key="c.id" :value="c.id"
+              :selected="c.id === chatSessionId">
+              {{ c.title || 'Untitled' }} ({{ c.message_count }})
+            </option>
+          </select>
+          <select v-model="chatProvider" @change="onProviderChange"
+            style="font-size: 10px; padding: 2px 6px; background: var(--bg-deep); border: 1px solid var(--border); border-radius: 4px; color: var(--text-3)">
+            <option v-for="p in CHAT_PROVIDERS" :key="p.id" :value="p.id">{{ p.label }}</option>
+          </select>
+          <select v-model="chatModel" @change="onModelChange"
+            style="font-size: 10px; padding: 2px 6px; background: var(--bg-deep); border: 1px solid var(--border); border-radius: 4px; color: var(--text-3); max-width: 140px">
+            <option v-for="m in (CHAT_PROVIDERS.find(p => p.id === chatProvider)?.models || [])" :key="m" :value="m">{{ m }}</option>
+          </select>
+          <!-- Ollama model status + load/unload -->
+          <template v-if="chatProvider === 'ollama'">
+            <span v-if="ollamaModelStatus(chatModel) === 'loaded'"
+              style="font-size: 8px; padding: 1px 6px; border-radius: 10px; background: #05966920; color: #34d399; border: 1px solid #05966940; white-space: nowrap"
+              :title="`${ollamaModelVram(chatModel)} GB VRAM`">
+              ● {{ ollamaModelVram(chatModel) }}GB
+            </span>
+            <span v-else-if="ollamaModelStatus(chatModel) === 'loading'"
+              style="font-size: 8px; padding: 1px 6px; border-radius: 10px; background: #f59e0b20; color: #fbbf24; border: 1px solid #f59e0b40; white-space: nowrap; animation: pulse 1.5s infinite">
+              ◌ loading...
+            </span>
+            <span v-else
+              style="font-size: 8px; padding: 1px 6px; border-radius: 10px; background: #64748b15; color: #64748b; border: 1px solid #64748b30; white-space: nowrap">
+              ○ idle
+            </span>
+            <button v-if="ollamaModelStatus(chatModel) === 'loaded'" @click="ollamaUnload()"
+              style="font-size: 8px; padding: 1px 6px; background: #1a1f2e; border: 1px solid #ef4444; border-radius: 4px; color: #ef4444; cursor: pointer"
+              title="Free VRAM">unload</button>
+            <button v-else-if="ollamaModelStatus(chatModel) !== 'loading'" @click="ollamaLoad(chatModel)"
+              style="font-size: 8px; padding: 1px 6px; background: #1a1f2e; border: 1px solid #059669; border-radius: 4px; color: #34d399; cursor: pointer"
+              title="Load into VRAM">load</button>
+            <span style="display:inline-flex;align-items:center;gap:2px;margin-left:4px">
+              <input v-model="ollamaPullName" placeholder="pull model..."
+                @keyup.enter="ollamaPull" :disabled="ollamaPulling"
+                style="font-size:8px;padding:1px 4px;width:90px;background:var(--bg-deep);border:1px solid var(--border);border-radius:3px;color:var(--text-3)" />
+              <button @click="ollamaPull" :disabled="ollamaPulling || !ollamaPullName.trim()"
+                style="font-size:8px;padding:1px 5px;background:#1a1f2e;border:1px solid var(--border);border-radius:3px;color:var(--text-3);cursor:pointer"
+                :style="ollamaPulling ? {opacity:0.5} : {}">{{ ollamaPulling ? '...' : '↓' }}</button>
+            </span>
+          </template>
+          <span style="margin-left: auto; display: flex; align-items: center; gap: 6px">
+            <button @click="chatVerbose = !chatVerbose"
+              style="font-size: 9px; padding: 2px 6px; border-radius: 4px; cursor: pointer; border: 1px solid #2a3044"
+              :style="{ background: chatVerbose ? '#6366f133' : '#1a1f2e', color: chatVerbose ? '#a5b4fc' : '#64748b' }"
+              :title="chatVerbose ? 'Verbose: showing all tool calls + results' : 'Brief: showing tool names only'">
+              {{ chatVerbose ? 'Verbose' : 'Brief' }}
+            </button>
+            <span v-if="chatTokens > 0" style="font-size: 9px; color: var(--text-4); font-family: monospace" :title="`~${Math.round(chatTokens)} tokens used`">
+              ~{{ chatTokens > 1000 ? (chatTokens / 1000).toFixed(1) + 'k' : Math.round(chatTokens) }} tok
+            </span>
+            <button v-if="chatSessionId" @click="openSaveSkillModal"
+              style="font-size: 9px; padding: 2px 8px; background: #1a1f2e; border: 1px solid #6366f1; border-radius: 4px; color: #a5b4fc; cursor: pointer"
+              title="Save this conversation as a reusable skill">Save skill</button>
+            <button v-if="chatMessages.length" @click="chatClear" style="font-size: 9px; padding: 2px 8px; background: #1a1f2e; border: 1px solid #2a3044; border-radius: 4px; color: #94a3b8; cursor: pointer">Clear</button>
+            <button v-if="chatSessionId && chatConversations.some(c => c.id === chatSessionId)" @click="deleteConversation(chatSessionId)"
+              style="font-size: 9px; padding: 2px 6px; background: #1a1f2e; border: 1px solid #2a3044; border-radius: 4px; color: #ef4444; cursor: pointer" title="Delete conversation">&#x1F5D1;</button>
+          </span>
+        </div>
+        <!-- Messages -->
+        <div id="agent-chat-scroll" style="flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px">
+          <div v-if="!chatMessages.length" style="color: var(--text-4); font-size: 12px; text-align: center; padding: 40px 20px; line-height: 1.6">
+            Chat with the agent to control this phone.<br/>
+            Try: "What app is open?" or "Open TikTok and search for cats"
+          </div>
+          <div v-for="(m, i) in chatMessages" :key="i"
+            :style="{
+              alignSelf: m.role === 'user' ? 'flex-end' : 'flex-start',
+              maxWidth: m.role === 'screenshot' ? '200px' : '85%',
+            }">
+            <!-- User message -->
+            <div v-if="m.role === 'user'" style="background: #6366f1; color: white; padding: 8px 12px; border-radius: 12px 12px 2px 12px; font-size: 12px; line-height: 1.5">
+              {{ m.content }}
+            </div>
+            <!-- Assistant text (markdown) -->
+            <div v-else-if="m.role === 'assistant'" class="agent-md" style="background: var(--bg-deep); color: var(--text-1); padding: 8px 12px; border-radius: 12px 12px 12px 2px; font-size: 12px; line-height: 1.6"
+              v-html="renderMd(m.content)"></div>
+            <!-- Tool call (compact inline) -->
+            <div v-else-if="m.role === 'tool_call'"
+              style="font-size: 10px; color: #38bdf8; padding: 2px 8px; display: inline-block; background: #0ea5e908; border-radius: 10px; border: 1px solid #0ea5e922">
+              {{ m.content }}
+            </div>
+            <!-- Tool result (verbose only, compact) -->
+            <div v-else-if="m.role === 'tool_result'"
+              style="font-size: 9px; font-family: 'JetBrains Mono', monospace; color: #475569; padding: 2px 8px; max-height: 60px; overflow: hidden; text-overflow: ellipsis; border-left: 2px solid #1e293b; margin-left: 8px">
+              {{ m.content }}
+            </div>
+            <!-- Screenshot -->
+            <img v-else-if="m.role === 'screenshot' && m.image" :src="'data:image/jpeg;base64,' + m.image"
+              style="width: 100%; border-radius: 8px; border: 1px solid var(--border)" />
+            <!-- Error -->
+            <div v-else-if="m.role === 'error'" style="font-size: 11px; color: #f87171; padding: 6px 10px; background: #ef444411; border-radius: 6px; border-left: 2px solid #ef4444">
+              {{ m.content }}
+            </div>
+          </div>
+          <!-- Activity indicator -->
+          <div v-if="chatSending" style="align-self: flex-start; padding: 4px 12px; display: flex; align-items: center; gap: 6px">
+            <span style="display: inline-block; width: 5px; height: 5px; border-radius: 50%; background: #f59e0b; animation: pulse 1s infinite"></span>
+            <span style="font-size: 10px; color: #f59e0b; font-family: monospace">{{ chatActivity || 'Thinking...' }}</span>
+          </div>
+        </div>
+        <!-- Input -->
+        <div style="padding: 8px 12px; border-top: 1px solid var(--border); display: flex; gap: 8px; flex-shrink: 0">
+          <input v-model="chatInput" @keyup.enter="!chatSending && chatSend()" :disabled="!selectedDevice"
+            :placeholder="chatSending ? 'Agent is working... type your next message' : 'Tell the agent what to do...'"
+            style="flex: 1; padding: 8px 12px; font-size: 12px; background: var(--bg-deep); border: 1px solid var(--border); border-radius: 8px; color: var(--text-1); outline: none" />
+          <button @click="toggleContinuousVoice" :disabled="!selectedDevice"
+            :style="{ 
+              padding: '8px 12px', 
+              fontSize: '11px', 
+              fontWeight: '600', 
+              background: isContinuousVoice ? '#ec4899' : '#4b5563', 
+              color: 'white', 
+              border: 'none', 
+              borderRadius: '8px', 
+              cursor: 'pointer', 
+              transition: 'all 0.15s',
+              opacity: !selectedDevice ? 0.3 : 1
+            }">
+            {{ isContinuousVoice ? '🔊 Live: ON' : '🎙️ Live Mode' }}
+          </button>
+          <button @click="startVoiceRecognition" :disabled="!selectedDevice || chatSending"
+            :style="{ 
+              padding: '8px 12px', 
+              fontSize: '11px', 
+              fontWeight: '600', 
+              background: isListening ? '#ef4444' : '#10b981', 
+              color: 'white', 
+              border: 'none', 
+              borderRadius: '8px', 
+              cursor: 'pointer', 
+              transition: 'all 0.15s',
+              opacity: !selectedDevice || chatSending ? 0.3 : 1
+            }">
+            {{ isListening ? '🎙️ Stop' : '🎙️ Mic' }}
+          </button>
+          <button v-if="chatSending" @click="chatStop"
+            style="padding: 8px 14px; font-size: 11px; font-weight: 600; background: #ef4444; color: white; border: none; border-radius: 8px; cursor: pointer">Stop</button>
+          <button v-else @click="chatSend" :disabled="!selectedDevice || !chatInput.trim()"
+            style="padding: 8px 16px; font-size: 11px; font-weight: 600; background: #6366f1; color: white; border: none; border-radius: 8px; cursor: pointer; transition: opacity 0.15s"
+            :style="{ opacity: !selectedDevice || !chatInput.trim() ? 0.3 : 1 }">Send</button>
+        </div>
+      </div>
+
+      <!-- RIGHT: Phone column (controls + stream + hw keys) -->
+      <div style="display: flex; flex-direction: column; gap: 4px; min-height: 0">
+        <!-- Top: device + stream controls -->
+        <div style="display: flex; gap: 4px; align-items: center; flex-wrap: wrap; padding: 4px">
+          <select v-model="selectedDevice" @change="updateNicknameRow" class="device-select" style="flex: 1; min-width: 80px; font-size: 10px; padding: 3px 4px">
+            <option value="">--</option>
+            <option v-for="d in devices" :key="d.serial" :value="d.serial">
+              {{ d.connection === 'wifi' ? '\uD83D\uDCF6' : '\uD83D\uDD0C' }} {{ d.nickname || d.model || d.serial }}
+            </option>
+          </select>
+          <button v-if="!streaming" class="ctrl-btn" :class="selectedIsIos ? 'ctrl-btn--mjpeg' : 'ctrl-btn--webrtc'"
+            style="font-size:9px;padding:3px 8px"
+            :title="selectedIsIos ? 'Start iOS WDA MJPEG stream' : 'Start Android WebRTC stream'"
+            @click="singleStreamMode = selectedIsIos ? 'mjpeg' : 'rtc'; startStream()">Stream</button>
+          <button v-if="!streaming && selectedIsIos" class="ctrl-btn ctrl-btn--webrtc"
+            style="font-size:9px;padding:3px 8px"
+            title="Start GhostAgent H.264 stream (beta — needs the patched WDA)"
+            @click="singleStreamMode = 'h264'; startStream()">H.264</button>
+          <span v-if="streaming" style="font-size:8px;padding:1px 6px;border-radius:10px;white-space:nowrap"
+            :title="streamInfoTitle(selectedDevice)"
+            :style="singleStreamMode === 'rtc'
+              ? { background: '#22c55e20', color: '#4ade80', border: '1px solid #22c55e40' }
+              : { background: '#6366f120', color: '#a5b4fc', border: '1px solid #6366f140' }">
+            {{ streamModeText(selectedDevice, singleStreamMode) }}
+          </span>
+          <span v-if="healthData[selectedDevice]" class="health-dots" :title="healthTitle(selectedDevice)">
+            <span v-for="(c, i) in healthDots(selectedDevice)" :key="i" class="health-dot" :style="{ background: healthDotColor(c) }"></span>
+          </span>
+          <button v-if="iosRecoveryCanApplyFix(selectedDevice)" class="ctrl-btn ctrl-btn--fix"
+            :disabled="iosRecoveryFixBusy(selectedDevice)"
+            @click="fixIssue(selectedDevice, iosRecoveryAction(selectedDevice))"
+            :title="iosRecoveryActionTitle(selectedDevice)">
+            {{ iosRecoveryFixBusy(selectedDevice) ? 'Fixing...' : iosRecoveryActionLabel(selectedDevice) }}
+          </button>
+          <button v-if="selectedDevice" class="ctrl-btn ctrl-btn--record"
+            :class="{ 'ctrl-btn--record-active': recordingState[selectedDevice] }"
+            :disabled="recordingBusy[selectedDevice]"
+            :title="recordingTitle(selectedDevice)"
+            @click="toggleRecording(selectedDevice)">
+            {{ recordingButtonText(selectedDevice) }}
+          </button>
+          <a v-if="recordingUrls[selectedDevice]" class="ctrl-btn ctrl-btn--record-link"
+            :href="recordingUrls[selectedDevice]" target="_blank" rel="noopener"
+            :title="recordingFilenames[selectedDevice] || 'Open recording'">MP4</a>
+          <button v-if="streaming" class="ctrl-btn ctrl-btn--stop" style="font-size:9px;padding:3px 8px" @click="stopStream">&#x23F9; Stop</button>
+          <button v-if="!selectedIsIos" class="ctrl-btn" style="font-size:9px;padding:3px 6px" @click="toggleOverlay(selectedDevice)"
+            :style="{ background: overlayOn[selectedDevice] ? '#fbbf24' : '', color: overlayOn[selectedDevice] ? '#000' : '#fbbf24' }">&#x1F522;</button>
+        </div>
+        <div v-if="recordingStatus[selectedDevice]" class="recording-status-line" :title="recordingStatus[selectedDevice]">
+          <span v-if="recordingState[selectedDevice]" class="recording-dot"></span>
+          {{ recordingStatus[selectedDevice] }}
+        </div>
+        <div v-if="streamInfoStatus[selectedDevice]" class="recording-status-line" :title="streamInfoStatus[selectedDevice]">
+          {{ streamInfoStatus[selectedDevice] }}
+        </div>
+        <div v-if="iosRecoveryVisible(selectedDevice)" class="ios-recovery-panel">
+          <div class="ios-recovery-head">
+            <span class="ios-recovery-state">{{ iosRecoveryState(selectedDevice) }}</span>
+            <span class="ios-recovery-summary-inline" :title="iosRecoverySummary(selectedDevice)">{{ iosRecoverySummary(selectedDevice) }}</span>
+            <button v-if="iosRecoveryCanApplyFix(selectedDevice)" class="ios-recovery-link ios-recovery-link--fix"
+              :disabled="iosRecoveryFixBusy(selectedDevice)"
+              @click="fixIssue(selectedDevice, iosRecoveryAction(selectedDevice))"
+              :title="iosRecoveryActionTitle(selectedDevice)">
+              {{ iosRecoveryFixBusy(selectedDevice) ? 'Fixing…' : iosRecoveryActionLabel(selectedDevice) }}
+            </button>
+            <button class="ios-recovery-link" @click="loadHealth(selectedDevice)">Refresh</button>
+            <button class="ios-recovery-link" @click="toggleRecoveryDetails(selectedDevice)">
+              {{ showRecoveryDetails[selectedDevice] ? 'Hide' : 'Details' }}
+            </button>
+          </div>
+          <div v-if="healthFixStatus[selectedDevice]" class="ios-recovery-status">{{ healthFixStatus[selectedDevice] }}</div>
+          <div v-if="showRecoveryDetails[selectedDevice]" class="ios-recovery-details">
+            <div v-if="iosHealthDetails(selectedDevice).length" class="ios-health-details">
+              <span v-for="row in iosHealthDetails(selectedDevice)" :key="row.label"
+                class="ios-health-chip" :class="{ 'ios-health-chip--ok': row.ok }"
+                :title="`${row.label}: ${row.value}`">
+                {{ row.label }} {{ row.value }}
+              </span>
+            </div>
+            <ol v-if="iosRecoverySteps(selectedDevice).length" class="ios-recovery-steps">
+              <li v-for="(step, i) in iosRecoverySteps(selectedDevice)" :key="i">{{ step }}</li>
+            </ol>
+            <div v-if="iosRecoveryCommands(selectedDevice).length" class="ios-recovery-commands">
+              <div v-for="command in iosRecoveryCommands(selectedDevice)" :key="command" class="ios-recovery-command">
+                <code>{{ command }}</code>
+                <button class="ios-copy-btn" @click="copyIosRecoveryCommand(selectedDevice, command)">Copy</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div v-if="selectedIsIos" class="news-panel">
+          <div class="news-panel-head">
+            <span class="news-title">Chrome News</span>
+            <button class="ctrl-btn ctrl-btn--mjpeg ctrl-btn--tiny" :disabled="newsRunning || !selectedDevice"
+              @click="runNewsSmoke">{{ newsRunning ? 'Reading...' : 'Read News' }}</button>
+          </div>
+          <div class="news-controls">
+            <input v-model="newsUrl" class="news-input news-input--url" title="URL" />
+            <input v-model="newsBundleId" class="news-input" title="iOS bundle id" />
+            <input v-model.number="newsMaxHeadlines" class="news-number" type="number" min="1" max="10" title="Headlines" />
+            <input v-model.number="newsMaxArticles" class="news-number" type="number" min="0" max="5" title="Articles" />
+            <label class="news-toggle" title="Save front-page and article screenshots">
+              <input v-model="newsSaveScreenshots" type="checkbox" />
+              shots
+            </label>
+            <input v-if="newsSaveScreenshots" v-model="newsOutDir" class="news-input news-input--out" title="Screenshot output directory" />
+          </div>
+          <div v-if="newsRunning" class="news-status">Running read_news...</div>
+          <div v-else-if="newsError" class="news-status news-status--error">{{ newsError }}</div>
+          <div v-if="newsResult" class="news-result">
+            <div class="news-summary">
+              <span class="news-pill" :class="newsResult.ok ? 'news-pill--ok' : 'news-pill--error'">
+                {{ newsResult.ok ? 'OK' : 'Fail' }}
+              </span>
+              <span>{{ newsHeadlines.length }} headlines</span>
+              <span>{{ newsArticles.length }} articles</span>
+              <span v-if="newsResult.completion">
+                {{ newsResult.completion.articles_with_body || 0 }}/{{ newsResult.completion.requested_articles || 0 }} bodies
+              </span>
+              <span v-if="newsResult.current_url" :title="newsResult.current_url">{{ newsResult.current_url }}</span>
+            </div>
+            <div class="news-evidence">
+              <span :title="JSON.stringify(newsExtraction.headlines || {})">
+                H {{ compactEvidence(newsExtraction.headlines) }}
+              </span>
+              <span :title="JSON.stringify(newsExtraction.front_page_text || {})">
+                Text {{ compactEvidence(newsExtraction.front_page_text) }}
+              </span>
+            </div>
+            <div v-if="newsScreenshotEntries.length" class="news-artifacts">
+              <span v-for="([name, path]) in newsScreenshotEntries" :key="name" :title="path">
+                {{ name }} {{ path }}
+              </span>
+            </div>
+            <div v-if="newsHeadlines.length" class="news-list">
+              <div v-for="(headline, i) in newsHeadlines.slice(0, 5)" :key="i" class="news-headline">
+                {{ headline.title || headline.text || headline.source_headline }}
+              </div>
+            </div>
+            <div v-if="newsArticles.length" class="news-articles">
+              <div v-for="(article, i) in newsArticles.slice(0, 3)" :key="i" class="news-article">
+                <div class="news-article-title">{{ article.page_title || article.source_headline || `Article ${i + 1}` }}</div>
+                <div class="news-article-meta">
+                  {{ article.open_method || articleEvidence(i).open_method || 'open' }}
+                  <span v-if="articleEvidence(i).text"> · {{ compactEvidence(articleEvidence(i).text) }}</span>
+                </div>
+                <div v-if="article.body_snippet" class="news-article-body">{{ article.body_snippet }}</div>
+                <div v-else-if="article.error" class="news-article-error">{{ article.error }}</div>
+              </div>
+            </div>
+            <div v-if="newsErrors.length" class="news-status news-status--error">{{ firstNewsError() }}</div>
+          </div>
+        </div>
+        <!-- Stream -->
+        <div class="stream-panel" style="flex: 1">
+        <div class="stream-viewport">
+          <video v-if="streaming && singleStreamMode === 'rtc'" :id="`rtc-video-${selectedDevice}`" autoplay playsinline muted
+            class="stream-media"
+            @mousedown="videoMouseDown(selectedDevice, $event)"
+            @mousemove="videoMouseMove(selectedDevice)"
+            @mouseup="videoMouseUp(selectedDevice, $event)"
+            @mouseleave="videoMouseLeave(selectedDevice)"
+            @touchstart="videoTouchStart(selectedDevice, $event)"
+            @touchmove="videoTouchMove(selectedDevice)"
+            @touchend="videoTouchEnd(selectedDevice, $event)" />
+          <img v-else-if="streaming && singleStreamMode === 'mjpeg' && singleMjpegUrl"
+            :id="`mjpeg-img-${selectedDevice}`"
+            :src="singleMjpegUrl"
+            class="stream-media"
+            crossorigin="anonymous"
+            draggable="false"
+            @load="mjpegImageLoaded(selectedDevice)"
+            @error="mjpegImageError(selectedDevice)"
+            @mousedown="mjpegMouseDown(selectedDevice, $event)"
+            @mousemove="mjpegMove(selectedDevice)"
+            @mouseup="mjpegMouseUp(selectedDevice, $event)"
+            @mouseleave="videoMouseLeave(selectedDevice)"
+            @touchstart="mjpegTouchStart(selectedDevice, $event)"
+            @touchmove="mjpegTouchMove(selectedDevice, $event)"
+            @touchend="mjpegTouchEnd(selectedDevice, $event)"
+            @touchcancel="mjpegTouchCancel(selectedDevice)"
+            @dragstart.prevent />
+          <canvas v-show="streaming && singleStreamMode === 'h264'"
+            :id="`h264-canvas-${selectedDevice}`" class="stream-media"
+            style="cursor: pointer; touch-action: none"
+            @mousedown="mjpegMouseDown(selectedDevice, $event)"
+            @mousemove="mjpegMove(selectedDevice)"
+            @mouseup="mjpegMouseUp(selectedDevice, $event)"
+            @mouseleave="videoMouseLeave(selectedDevice)"
+            @touchstart="mjpegTouchStart(selectedDevice, $event)"
+            @touchmove="mjpegTouchMove(selectedDevice, $event)"
+            @touchend="mjpegTouchEnd(selectedDevice, $event)"
+            @touchcancel="mjpegTouchCancel(selectedDevice)"
+            @dragstart.prevent />
+          <div v-if="streaming && singleStreamMode === 'h264' && h264ShowMetrics" class="h264-badge" @click="h264ShowMetrics = false" title="Click to hide">
+            <template v-if="h264M.renderFps || h264M.recvFps">
+              recv {{ h264M.recvFps }} · render {{ h264M.renderFps }}fps · q{{ h264M.queue }} · {{ h264M.latencyMs }}ms · {{ h264M.kbps }}kbps<span v-if="h264M.dropped"> · drop {{ h264M.dropped }}</span>
+            </template>
+            <template v-else>H.264 {{ h264Status }}</template>
+          </div>
+          <button v-if="streaming && singleStreamMode === 'h264' && !h264ShowMetrics" class="h264-badge h264-badge--show" @click="h264ShowMetrics = true" title="Show metrics">ⓘ</button>
+          <div v-if="!streaming" class="stream-placeholder">
+            Select device &amp; start stream<br/>or chat — auto-starts
+          </div>
+          <div v-if="blackWarning[selectedDevice]" class="black-warning">
+            {{ blackWarningText(selectedDevice) }}
+            <button v-if="!selectedIsIos" @click="blackWarning[selectedDevice] = false; toggleSingleMode()" class="black-warning-btn">Switch</button>
+          </div>
+          <!-- Frozen stream overlay -->
+          <div v-if="streamFrozen[selectedDevice]" class="frozen-overlay" @click="reconnectStream(selectedDevice)">
+            <div class="frozen-ghost">&#x1F47B;</div>
+            <div class="frozen-text">Stream frozen</div>
+            <div class="frozen-hint">Tap to reconnect</div>
+          </div>
+        </div>
+      </div>
+        <!-- Bottom: hardware keys -->
+        <div style="display: flex; gap: 3px; padding: 4px; justify-content: center; flex-wrap: wrap">
+          <button v-for="key in hardwareKeys(selectedDevice)" :key="String(key.key)" class="ctrl-btn"
+            style="font-size:9px;padding:3px 8px" :title="key.title" @click="sendKeyTo(selectedDevice, key.key)">
+            {{ key.label }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════ Multi Device ═══════════════ -->
+    <div v-if="subTab === 'multi'">
+      <!-- Controls header -->
+      <div class="multi-header">
+        <button v-if="hasAndroidDevices" class="ctrl-btn ctrl-btn--webrtc" @click="startAllStreams('rtc')" title="Android devices use Portal WebRTC; iOS devices use WDA MJPEG automatically">&#x26A1; Start All (Auto)</button>
+        <button class="ctrl-btn ctrl-btn--mjpeg" @click="startAllStreams('mjpeg')" :title="hasIosDevices ? 'Start WDA MJPEG on iOS and MJPEG on Android' : 'Start Android MJPEG streams'">&#x25B6; Start All (MJPEG)</button>
+        <button class="ctrl-btn ctrl-btn--stop" @click="stopAllStreams">&#x23F9; Stop All</button>
+        <button v-if="hasAndroidDevices" class="ctrl-btn" @click="showWirelessModal = true" style="background: #0ea5e922; color: #38bdf8; border-color: #0ea5e955">&#x1F4F6; WiFi Connect</button>
+        <button class="ctrl-btn" @click="loadAllHealth" style="font-size: 10px">Health &#x27F3;</button>
+        <span class="device-count">{{ devices.length }} device(s)</span>
+      </div>
+
+      <div class="multi-grid"
+        :style="{ gridTemplateColumns: devices.length <= 1 ? '1fr' : devices.length === 2 ? 'repeat(2, 1fr)' : devices.length === 3 ? 'repeat(3, 1fr)' : 'repeat(4, 1fr)' }">
+        <div v-for="d in devices" :key="d.serial" class="multi-card">
+          <!-- Header -->
+          <div class="multi-card-header">
+            <span class="multi-device-name">{{ d.connection === 'wifi' ? '\uD83D\uDCF6' : '\uD83D\uDD0C' }} {{ d.nickname || d.model || d.serial }}</span>
+            <span v-if="healthData[d.serial]" class="health-dots" :title="healthTitle(d.serial)">
+              <span v-for="(c, i) in healthDots(d.serial)" :key="i" class="health-dot" :style="{ background: healthDotColor(c) }"></span>
+            </span>
+            <button v-if="iosRecoveryCanApplyFix(d.serial)" class="hw-key-btn"
+              :disabled="iosRecoveryFixBusy(d.serial)"
+              @click="fixIssue(d.serial, iosRecoveryAction(d.serial))"
+              :title="iosRecoveryActionTitle(d.serial)">
+              {{ iosRecoveryFixBusy(d.serial) ? '...' : iosRecoveryActionLabel(d.serial) }}
+            </button>
+            <button v-if="healthData[d.serial]?.wifi?.ip && !isIosDevice(d.serial) && d.connection !== 'wifi'" class="hw-key-btn"
+              @click="goWireless(d.serial)" title="Go Wireless" style="color: #38bdf8">&#x1F4F6;</button>
+            <div class="multi-hw-keys">
+              <button v-for="key in hardwareKeys(d.serial)" :key="String(key.key)" class="hw-key-btn"
+                @click="sendKeyTo(d.serial, key.key)" :title="key.title">{{ key.label }}</button>
+              <button v-if="!isIosDevice(d.serial)" class="hw-key-btn" @click="toggleOverlay(d.serial)"
+                :style="{ background: overlayOn[d.serial] ? '#fbbf24' : '', color: overlayOn[d.serial] ? '#000' : '#fbbf24' }" title="Toggle UI Grid">&#x1F522;</button>
+            </div>
+            <div class="multi-stream-btns">
+              <span class="multi-mode-badge"
+                :title="streamInfoTitle(d.serial)"
+                :style="multiStreamMode[d.serial] === 'mjpeg' ? { background: '#6366f133', color: '#a5b4fc' } : rtcStatus[d.serial] === 'Streaming' ? { background: '#22c55e22', color: '#4ade80' } : { color: '#475569' }">
+                {{ multiStreaming[d.serial] ? multiStreamLabel(d.serial) : '' }}
+              </span>
+              <button v-if="rtcStatus[d.serial]?.includes('Portal') || rtcStatus[d.serial]?.includes('fix')"
+                class="ctrl-btn ctrl-btn--fix"
+                @click="rtcFixPortal(d.serial)" title="Fix Portal">Fix</button>
+              <button class="ctrl-btn ctrl-btn--record ctrl-btn--tiny"
+                :class="{ 'ctrl-btn--record-active': recordingState[d.serial] }"
+                :disabled="recordingBusy[d.serial]"
+                :title="recordingTitle(d.serial)"
+                @click="toggleRecording(d.serial)">
+                {{ recordingTinyText(d.serial) }}
+              </button>
+              <a v-if="recordingUrls[d.serial]" class="ctrl-btn ctrl-btn--record-link ctrl-btn--tiny"
+                :href="recordingUrls[d.serial]" target="_blank" rel="noopener"
+                :title="recordingFilenames[d.serial] || 'Open recording'">MP4</a>
+              <template v-if="!multiStreaming[d.serial]">
+                <button v-if="!isIosDevice(d.serial)" class="ctrl-btn ctrl-btn--webrtc ctrl-btn--tiny" @click="startMultiStream(d.serial, 'rtc')" title="WebRTC">&#x26A1;</button>
+                <button class="ctrl-btn ctrl-btn--mjpeg ctrl-btn--tiny" @click="startMultiStream(d.serial, 'mjpeg')" title="MJPEG">&#x25B6;</button>
+              </template>
+              <template v-else>
+                <button class="ctrl-btn ctrl-btn--stop ctrl-btn--tiny" @click="stopMultiStream(d.serial)">&#x23F9;</button>
+                <button v-if="!isIosDevice(d.serial)" class="ctrl-btn ctrl-btn--tiny" @click="toggleMultiMode(d.serial)"
+                  :style="{ background: multiStreamMode[d.serial] === 'rtc' ? '#0ea5e922' : '#6366f122', color: multiStreamMode[d.serial] === 'rtc' ? '#38bdf8' : '#a5b4fc', borderColor: multiStreamMode[d.serial] === 'rtc' ? '#0ea5e955' : '#6366f155' }"
+                  :title="'Switch to ' + (multiStreamMode[d.serial] === 'rtc' ? 'MJPEG' : 'WebRTC')">&#x21C4;</button>
+              </template>
+              <button class="ctrl-btn ctrl-btn--tiny" @click="selectedDevice = d.serial; subTab = 'single'; startStream()" title="Expand">&#x2197;</button>
+            </div>
+          </div>
+          <div v-if="iosRecoveryVisible(d.serial)" class="ios-recovery-compact" :title="healthTitle(d.serial)">
+            <span>{{ iosRecoveryState(d.serial) }}</span>
+            <span v-if="iosRecoveryCode(d.serial)">{{ iosRecoveryCode(d.serial) }}</span>
+            <span v-if="healthFixStatus[d.serial]">{{ healthFixStatus[d.serial] }}</span>
+          </div>
+          <div v-if="recordingStatus[d.serial]" class="multi-recording-status" :title="recordingStatus[d.serial]">
+            <span v-if="recordingState[d.serial]" class="recording-dot"></span>
+            {{ recordingStatus[d.serial] }}
+          </div>
+          <div v-if="streamInfoStatus[d.serial]" class="multi-recording-status" :title="streamInfoStatus[d.serial]">
+            {{ streamInfoStatus[d.serial] }}
+          </div>
+
+          <!-- Stream area -->
+          <div class="multi-stream-area">
+            <!-- WebRTC video -->
+            <video v-if="multiStreaming[d.serial] && multiStreamMode[d.serial] === 'rtc'" :id="`rtc-video-${d.serial}`" autoplay playsinline muted
+              class="multi-stream-media"
+              @mousedown="videoMouseDown(d.serial, $event)"
+              @mousemove="videoMouseMove(d.serial)"
+              @mouseup="videoMouseUp(d.serial, $event)"
+              @mouseleave="videoMouseLeave(d.serial)"
+              @touchstart="videoTouchStart(d.serial, $event)"
+              @touchmove="videoTouchMove(d.serial)"
+              @touchend="videoTouchEnd(d.serial, $event)" />
+            <!-- MJPEG img -->
+            <img v-else-if="multiStreaming[d.serial] && multiStreamMode[d.serial] === 'mjpeg' && mjpegUrls[d.serial]"
+              :id="`mjpeg-img-${d.serial}`"
+              :src="mjpegUrls[d.serial]"
+              class="multi-stream-media"
+              crossorigin="anonymous"
+              draggable="false"
+              @load="mjpegImageLoaded(d.serial)"
+              @error="mjpegImageError(d.serial)"
+              @mousedown="mjpegMouseDown(d.serial, $event)"
+              @mousemove="mjpegMove(d.serial)"
+              @mouseup="mjpegMouseUp(d.serial, $event)"
+              @mouseleave="videoMouseLeave(d.serial)"
+              @touchstart="mjpegTouchStart(d.serial, $event)"
+              @touchmove="mjpegTouchMove(d.serial, $event)"
+              @touchend="mjpegTouchEnd(d.serial, $event)"
+              @touchcancel="mjpegTouchCancel(d.serial)"
+              @dragstart.prevent />
+            <div v-else class="multi-stream-placeholder">{{ streamPlaceholderText(d.serial) }}</div>
+            <!-- Black screen warning -->
+            <div v-if="blackWarning[d.serial]" class="black-warning black-warning--compact">
+              {{ blackWarningText(d.serial) }}
+              <button v-if="!isIosDevice(d.serial)" @click="blackWarning[d.serial] = false; toggleMultiMode(d.serial)" class="black-warning-btn">Switch</button>
+            </div>
+            <!-- Frozen stream overlay -->
+            <div v-if="streamFrozen[d.serial]" class="frozen-overlay" @click="reconnectStream(d.serial)">
+              <div class="frozen-ghost">&#x1F47B;</div>
+              <div class="frozen-text">Frozen</div>
+              <div class="frozen-hint">Tap to reconnect</div>
+            </div>
+          </div>
+
+          <!-- Per-device logs -->
+          <div class="multi-logs-area">
+            <div class="multi-logs-header">&#x25CF; Logs</div>
+            <div class="multi-logs-scroll">
+              <div v-for="(line, i) in (multiLogs[d.serial] || []).slice(-30)" :key="i"
+                class="multi-log-line"
+                :style="{
+                  color: line.includes('[ERROR]') || line.includes('[CRITICAL]') ? '#f87171'
+                    : line.includes('[WARN') ? '#fbbf24'
+                    : line.includes('[INFO]') ? '#34d399'
+                    : '#5b7a5e',
+                  borderLeft: line.includes('[ERROR]') ? '2px solid #f87171'
+                    : line.includes('[WARN') ? '2px solid #fbbf24'
+                    : '2px solid transparent',
+                  paddingLeft: '6px'
+                }">{{ line }}</div>
+              <div v-if="!(multiLogs[d.serial] || []).length" class="multi-log-empty">waiting for logs...</div>
+            </div>
+          </div>
+        </div>
+        <div v-if="!devices.length" class="multi-empty">
+          No devices connected.
+        </div>
+      </div>
+    </div>
+    <!-- Wireless connect modal -->
+    <div v-if="showWirelessModal && hasAndroidDevices" class="fixed inset-0 bg-black/60 flex items-center justify-center z-50" @click.self="showWirelessModal = false">
+      <div class="card" style="width: 360px">
+        <h3 class="font-bold text-sm mb-3" style="color: var(--text-1)">Connect WiFi Device</h3>
+        <div class="mb-2">
+          <label class="block text-xs mb-1" style="color: var(--text-3)">Device IP</label>
+          <input v-model="wirelessIp" placeholder="192.168.1.42" class="w-full px-3 py-2 rounded-lg text-sm"
+            style="background: var(--bg-deep); border: 1px solid var(--border); color: var(--text-1)" />
+        </div>
+        <div class="mb-2">
+          <label class="block text-xs mb-1" style="color: var(--text-3)">Port (default 5555)</label>
+          <input v-model="wirelessPort" placeholder="5555" class="w-full px-3 py-2 rounded-lg text-sm"
+            style="background: var(--bg-deep); border: 1px solid var(--border); color: var(--text-1)" />
+        </div>
+        <div class="mb-3">
+          <label class="block text-xs mb-1" style="color: var(--text-3)">Pairing code (Android 11+ only, leave blank for reconnect)</label>
+          <input v-model="wirelessCode" placeholder="123456" class="w-full px-3 py-2 rounded-lg text-sm"
+            style="background: var(--bg-deep); border: 1px solid var(--border); color: var(--text-1)" />
+        </div>
+        <div v-if="wirelessResult" class="mb-2 p-2 rounded text-xs" style="background: var(--bg-deep); color: var(--text-2)">{{ wirelessResult }}</div>
+        <div class="flex gap-2">
+          <button class="btn btn-primary" @click="wirelessConnect">Connect</button>
+          <button class="btn" @click="showWirelessModal = false">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Save conversation as skill modal -->
+    <div v-if="saveSkillModal" class="fixed inset-0 bg-black/60 flex items-center justify-center z-50" @click.self="saveSkillModal = false">
+      <div class="card" style="width: 480px; max-width: 92vw; max-height: 88vh; overflow-y: auto">
+        <h3 class="font-bold text-sm mb-3" style="color: var(--text-1)">Save conversation as skill</h3>
+
+        <!-- Kind toggle -->
+        <div class="mb-3">
+          <label class="block text-xs mb-1" style="color: var(--text-3)">Type</label>
+          <div class="flex gap-2">
+            <button class="btn" :class="saveSkillKind === 'hard' ? 'btn-primary' : ''" @click="setSaveSkillKind('hard')">Hard (replay steps)</button>
+            <button class="btn" :class="saveSkillKind === 'soft' ? 'btn-primary' : ''" @click="setSaveSkillKind('soft')">Soft (guidance)</button>
+          </div>
+        </div>
+
+        <div class="mb-2">
+          <label class="block text-xs mb-1" style="color: var(--text-3)">Name</label>
+          <input v-model="saveSkillName" placeholder="my_skill" class="w-full px-3 py-2 rounded-lg text-sm"
+            style="background: var(--bg-deep); border: 1px solid var(--border); color: var(--text-1)" />
+        </div>
+        <div class="mb-2">
+          <label class="block text-xs mb-1" style="color: var(--text-3)">App package</label>
+          <input v-model="saveSkillPackage" placeholder="com.example.app" class="w-full px-3 py-2 rounded-lg text-sm"
+            style="background: var(--bg-deep); border: 1px solid var(--border); color: var(--text-1)" />
+        </div>
+        <div class="mb-2">
+          <label class="block text-xs mb-1" style="color: var(--text-3)">Description</label>
+          <input v-model="saveSkillDesc" placeholder="What this skill does" class="w-full px-3 py-2 rounded-lg text-sm"
+            style="background: var(--bg-deep); border: 1px solid var(--border); color: var(--text-1)" />
+        </div>
+
+        <!-- Hard: summary + editable steps JSON -->
+        <template v-if="saveSkillKind === 'hard'">
+          <div v-if="saveSkillLoading" class="mb-2 text-xs" style="color: var(--text-3)">Loading steps from conversation…</div>
+          <div v-if="saveSkillSummary" class="mb-2 p-2 rounded text-xs" style="background: var(--bg-deep); color: var(--text-2)">{{ saveSkillSummary }}</div>
+          <div class="mb-2">
+            <label class="block text-xs mb-1" style="color: var(--text-3)">Steps (JSON)</label>
+            <textarea v-model="saveSkillSteps" rows="10" class="w-full px-3 py-2 rounded-lg text-sm font-mono"
+              style="background: var(--bg-deep); border: 1px solid var(--border); color: var(--text-1)" />
+          </div>
+        </template>
+
+        <!-- Soft: guidance markdown -->
+        <template v-else>
+          <div class="mb-2">
+            <label class="block text-xs mb-1" style="color: var(--text-3)">Guidance (markdown)</label>
+            <textarea v-model="saveSkillGuidance" rows="10" placeholder="Describe how to accomplish the task…"
+              class="w-full px-3 py-2 rounded-lg text-sm font-mono"
+              style="background: var(--bg-deep); border: 1px solid var(--border); color: var(--text-1)" />
+          </div>
+        </template>
+
+        <div v-if="saveSkillError" class="mb-2 p-2 rounded text-xs" style="background: #ef444411; color: #f87171">{{ saveSkillError }}</div>
+
+        <div class="flex gap-2">
+          <button class="btn btn-primary" :disabled="saveSkillSaving" @click="saveSkillFromChat">{{ saveSkillSaving ? 'Saving…' : 'Save' }}</button>
+          <button v-if="saveSkillKind === 'hard'" class="btn" :disabled="saveSkillLoading" @click="loadDraftSteps">Reload steps</button>
+          <button class="btn" @click="saveSkillModal = false">Close</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+/* ── Agent markdown ──────────────────────────────────────────────── */
+.agent-md :deep(h1), .agent-md :deep(h2), .agent-md :deep(h3) { font-size: 13px; font-weight: 700; margin: 8px 0 4px; color: var(--text-1); }
+.agent-md :deep(p) { margin: 4px 0; }
+.agent-md :deep(ul), .agent-md :deep(ol) { margin: 4px 0; padding-left: 18px; }
+.agent-md :deep(li) { margin: 2px 0; }
+.agent-md :deep(code) { background: #1e293b; padding: 1px 4px; border-radius: 3px; font-size: 11px; color: #a5b4fc; }
+.agent-md :deep(pre) { background: #0a0e14; padding: 8px; border-radius: 6px; overflow-x: auto; font-size: 10px; margin: 6px 0; }
+.agent-md :deep(pre code) { background: none; padding: 0; }
+.agent-md :deep(table) { border-collapse: collapse; width: 100%; font-size: 11px; margin: 6px 0; }
+.agent-md :deep(th), .agent-md :deep(td) { border: 1px solid #1e293b; padding: 4px 8px; text-align: left; }
+.agent-md :deep(th) { background: #111827; font-weight: 600; }
+.agent-md :deep(strong) { color: var(--text-1); }
+.agent-md :deep(hr) { border: none; border-top: 1px solid #1e293b; margin: 8px 0; }
+
+/* ── Animation ──────────────────────────────────────────────────── */
+@keyframes fadeInOut {
+  0% { opacity: 0; transform: translateX(-50%) translateY(-4px); }
+  8% { opacity: 1; transform: translateX(-50%) translateY(0); }
+  75% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+/* ── Root ────────────────────────────────────────────────────────── */
+.phone-admin {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 80px);
+  overflow: hidden;
+}
+
+/* ── Tab Bar ─────────────────────────────────────────────────────── */
+.tab-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 0 12px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 12px;
+  flex-shrink: 0;
+}
+
+.tab-group {
+  display: flex;
+  gap: 2px;
+  background: var(--bg-deep);
+  border-radius: 8px;
+  padding: 3px;
+  border: 1px solid var(--border);
+}
+
+.tab-btn {
+  padding: 6px 16px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  border: none;
+  cursor: pointer;
+  background: transparent;
+  color: var(--text-4);
+  transition: all 0.15s;
+}
+.tab-btn:hover { color: var(--text-2); }
+.tab-btn.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.status-text {
+  font-size: 11px;
+  color: var(--text-4);
+}
+
+/* ── Single Device Layout ────────────────────────────────────────── */
+.single-layout {
+  display: grid;
+  grid-template-columns: 1fr 320px;
+  gap: 8px;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Stream panel (left) */
+.stream-panel {
+  background: #070b10;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
+  overflow: hidden;
+  min-height: 0;
+  min-width: 0;
+}
+
+.stream-viewport {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #070b10;
+  overflow: hidden;
+  width: 100%;
+  height: 100%;
+}
+
+.stream-media {
+  height: 100%;
+  width: auto;
+  max-width: 100%;
+  object-fit: contain;
+  cursor: crosshair;
+  touch-action: none;
+  user-select: none;
+}
+
+.h264-badge {
+  position: absolute; top: 6px; left: 6px; z-index: 3;
+  font-size: 9px; padding: 2px 7px; border-radius: 10px;
+  background: rgba(99,102,241,0.85); color: #fff; white-space: nowrap;
+  cursor: pointer; border: none;
+}
+.h264-badge--show { opacity: 0.5; padding: 2px 6px; }
+.h264-badge--show:hover { opacity: 1; }
+.stream-placeholder {
+  color: var(--text-4);
+  font-size: 13px;
+  text-align: center;
+  padding: 40px;
+}
+
+/* Sidebar (right) */
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.sidebar-section {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.sidebar-section:last-child { border-bottom: none; }
+
+.sidebar-section--grow {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.section-label {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--text-4);
+  margin-bottom: 8px;
+  text-transform: uppercase;
+}
+
+/* Device selector */
+.device-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.device-select {
+  flex: 1;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  background: var(--bg-deep);
+  border: 1px solid var(--border);
+  color: var(--text-1);
+}
+
+.nickname-row {
+  margin-top: 6px;
+}
+
+.nickname-edit {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.nickname-input {
+  flex: 1;
+  padding: 4px 8px;
+  border-radius: 5px;
+  font-size: 12px;
+  background: var(--bg-deep);
+  border: 1px solid var(--border);
+  color: var(--text-1);
+}
+
+/* Control buttons */
+.ctrl-btn {
+  padding: 5px 10px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  color: var(--text-2);
+  transition: all 0.12s;
+  white-space: nowrap;
+}
+.ctrl-btn:hover { border-color: var(--accent); color: var(--text-1); }
+.ctrl-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.ctrl-btn--webrtc { background: #0ea5e9; color: #fff; border-color: #0ea5e9; }
+.ctrl-btn--webrtc:hover { background: #0284c7; border-color: #0284c7; }
+.ctrl-btn--mjpeg { background: var(--accent); color: #fff; border-color: var(--accent); }
+.ctrl-btn--mjpeg:hover { background: #4f46e5; border-color: #4f46e5; }
+.ctrl-btn--stop { border-color: #475569; color: var(--text-3); }
+.ctrl-btn--confirm { color: #34d399; border-color: #34d399; }
+.ctrl-btn--fix { background: #f59e0b; color: #000; border: none; font-size: 9px; padding: 2px 6px; }
+.ctrl-btn--fix:disabled,
+.hw-key-btn:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+.ctrl-btn--record {
+  border-color: #7f1d1d;
+  color: #fca5a5;
+  background: #1f1118;
+}
+.ctrl-btn--record:hover:not(:disabled) {
+  border-color: #ef4444;
+  color: #fecaca;
+}
+.ctrl-btn--record-active {
+  background: #ef444433;
+  border-color: #ef444466;
+  color: #fecaca;
+}
+.ctrl-btn--record-link {
+  border-color: #164e63;
+  color: #67e8f9;
+  background: #082f49;
+  text-decoration: none;
+}
+
+.ctrl-btn--tiny { font-size: 9px; padding: 2px 6px; }
+
+.recording-status-line,
+.multi-recording-status {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 18px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-3);
+}
+
+.recording-status-line {
+  padding: 0 6px;
+  font-size: 9px;
+}
+
+.multi-recording-status {
+  padding: 2px 6px 0;
+  font-size: 8px;
+}
+
+.recording-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #ef4444;
+  box-shadow: 0 0 0 2px #7f1d1d55;
+  flex-shrink: 0;
+}
+
+.news-panel {
+  margin: 0 4px;
+  padding: 8px;
+  border: 1px solid #1e293b;
+  border-radius: 8px;
+  background: #0a0f16;
+  flex-shrink: 0;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.news-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.news-title {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-2);
+}
+
+.news-panel-head .ctrl-btn {
+  margin-left: auto;
+}
+
+.news-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) 42px 42px 48px;
+  gap: 4px;
+}
+
+.news-input,
+.news-number {
+  min-width: 0;
+  padding: 4px 6px;
+  border-radius: 5px;
+  border: 1px solid #1e293b;
+  background: #070b10;
+  color: var(--text-2);
+  font-size: 9px;
+}
+
+.news-input--out {
+  grid-column: 1 / -1;
+}
+
+.news-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  min-width: 0;
+  padding: 4px 5px;
+  border-radius: 5px;
+  border: 1px solid #1e293b;
+  background: #070b10;
+  color: #94a3b8;
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+.news-toggle input {
+  width: 11px;
+  height: 11px;
+  accent-color: #6366f1;
+}
+
+.news-status {
+  margin-top: 6px;
+  padding: 4px 6px;
+  border-radius: 5px;
+  background: #111827;
+  color: #94a3b8;
+  font-size: 9px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.news-status--error {
+  background: #3f1d26;
+  color: #fca5a5;
+  white-space: normal;
+}
+
+.news-result {
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.news-summary,
+.news-evidence,
+.news-artifacts {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  color: var(--text-3);
+  font-size: 9px;
+}
+
+.news-pill {
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 8px;
+  font-weight: 700;
+}
+
+.news-pill--ok {
+  background: #14532d;
+  color: #86efac;
+}
+
+.news-pill--error {
+  background: #7f1d1d;
+  color: #fecaca;
+}
+
+.news-evidence span {
+  padding: 2px 5px;
+  border: 1px solid #1e293b;
+  border-radius: 4px;
+  background: #070b10;
+  color: #67e8f9;
+}
+
+.news-artifacts span {
+  max-width: 100%;
+  padding: 2px 5px;
+  border: 1px solid #1e293b;
+  border-radius: 4px;
+  background: #111827;
+  color: #a5b4fc;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.news-list,
+.news-articles {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.news-headline,
+.news-article {
+  padding: 5px 6px;
+  border: 1px solid #1e293b;
+  border-radius: 6px;
+  background: #070b10;
+}
+
+.news-headline,
+.news-article-title {
+  color: var(--text-2);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.news-article-meta {
+  margin-top: 2px;
+  color: #64748b;
+  font-size: 8px;
+}
+
+.news-article-body,
+.news-article-error {
+  margin-top: 4px;
+  color: var(--text-3);
+  font-size: 9px;
+  line-height: 1.4;
+  max-height: 58px;
+  overflow: hidden;
+  white-space: pre-line;
+}
+
+.news-article-error {
+  color: #fca5a5;
+}
+
+.btn-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.stream-status-line {
+  margin-top: 6px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.stream-status-text {
+  font-size: 10px;
+  color: var(--text-4);
+}
+
+/* Hardware keys grid */
+.hw-keys-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr 1fr;
+  gap: 3px;
+}
+.hw-keys-grid .ctrl-btn {
+  padding: 4px 2px;
+  font-size: 9px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Log filter row */
+.log-filter-row {
+  display: flex;
+  gap: 3px;
+  margin-bottom: 6px;
+  flex-wrap: wrap;
+}
+
+.log-filter-btn {
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 500;
+  cursor: pointer;
+  background: var(--bg-deep);
+  color: var(--text-3);
+  border: 1px solid var(--border);
+  transition: all 0.12s;
+}
+.log-filter-btn.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+  font-weight: 700;
+}
+
+.log-scroll {
+  flex: 1;
+  min-height: 60px;
+  max-height: 180px;
+  overflow-y: auto;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--bg-deep);
+  font-family: 'Courier New', monospace;
+  font-size: 10px;
+  line-height: 1.6;
+}
+.log-scroll--bot { color: #10b981; }
+
+.log-line {
+  color: var(--text-4);
+  word-break: break-all;
+}
+
+.log-empty {
+  color: var(--text-4);
+  font-style: italic;
+}
+
+/* Bot log select */
+.bot-log-select {
+  width: 100%;
+  font-size: 11px;
+  padding: 4px 8px;
+  margin-bottom: 6px;
+  background: var(--bg-deep);
+  color: var(--text-3);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+
+/* Black screen warning */
+.black-warning {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #f59e0bee;
+  color: #000;
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  z-index: 10;
+  pointer-events: auto;
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  animation: fadeInOut 6s ease-in-out forwards;
+}
+.black-warning--compact {
+  padding: 4px 10px;
+  font-size: 9px;
+  gap: 6px;
+}
+
+.black-warning-btn {
+  background: #000;
+  color: #f59e0b;
+  border: none;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+/* ── Frozen stream overlay ──────────────────────────────────────── */
+.frozen-overlay {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  background: rgba(10, 15, 12, 0.85);
+  backdrop-filter: blur(4px);
+  cursor: pointer; z-index: 10;
+  border-radius: inherit;
+}
+.frozen-ghost { font-size: 48px; margin-bottom: 8px; opacity: 0.9; }
+.frozen-text { font-size: 14px; font-weight: 700; color: #f59e0b; letter-spacing: 0.5px; }
+.frozen-hint { font-size: 11px; color: #8a9a8d; margin-top: 4px; }
+
+/* ── Multi Device Layout ─────────────────────────────────────────── */
+.multi-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.device-count {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-4);
+}
+
+.multi-grid {
+  display: grid;
+  gap: 8px;
+  height: calc(100vh - 180px);
+}
+
+.multi-card {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  min-height: 0;
+}
+
+.multi-card-header {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.multi-device-name {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-2);
+}
+
+.health-dots {
+  display: flex;
+  gap: 3px;
+  align-items: center;
+  margin-left: 4px;
+}
+.health-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.ios-recovery-panel {
+  margin: 0 4px 4px;
+  padding: 8px 10px;
+  border: 1px solid #f59e0b44;
+  background: #0f172a;
+  border-radius: 6px;
+  color: var(--text-2);
+  font-size: 10px;
+}
+
+.ios-recovery-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+  min-width: 0;
+}
+
+.ios-recovery-state {
+  color: #fbbf24;
+  font-weight: 700;
+}
+
+.ios-recovery-code {
+  color: #fed7aa;
+  border: 1px solid #f59e0b55;
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+
+.ios-recovery-link {
+  margin-left: auto;
+  color: #93c5fd;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-size: 10px;
+  padding: 0;
+}
+
+.ios-recovery-summary {
+  color: var(--text-3);
+  line-height: 1.35;
+}
+
+.ios-recovery-summary-inline {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-3);
+  font-size: 11px;
+  opacity: 0.85;
+}
+
+.ios-recovery-link--fix {
+  margin-left: 0;
+  color: #6ee7b7;
+  font-weight: 700;
+}
+
+.ios-recovery-details {
+  margin-top: 6px;
+}
+
+.ios-recovery-status {
+  margin-top: 4px;
+  color: #93c5fd;
+  font-size: 9px;
+  line-height: 1.3;
+}
+
+.ios-health-details {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.ios-health-chip {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 2px 5px;
+  border: 1px solid #334155;
+  border-radius: 4px;
+  background: #020617;
+  color: #94a3b8;
+  font-size: 9px;
+}
+
+.ios-health-chip--ok {
+  border-color: #16653466;
+  color: #86efac;
+  background: #052e1622;
+}
+
+.ios-recovery-steps {
+  margin: 5px 0 0;
+  padding-left: 16px;
+  color: var(--text-4);
+  line-height: 1.35;
+}
+
+.ios-recovery-commands {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.ios-recovery-command {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px;
+  align-items: center;
+}
+
+.ios-recovery-command code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 4px 6px;
+  border: 1px solid #334155;
+  border-radius: 4px;
+  background: #020617;
+  color: #c4b5fd;
+  font-size: 9px;
+}
+
+.ios-copy-btn {
+  padding: 3px 6px;
+  border: 1px solid #334155;
+  border-radius: 4px;
+  background: #111827;
+  color: #93c5fd;
+  font-size: 9px;
+  cursor: pointer;
+}
+
+.ios-copy-btn:hover {
+  border-color: #60a5fa;
+  color: #bfdbfe;
+}
+
+.ios-recovery-compact {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: 3px 6px;
+  border-top: 1px solid #f59e0b33;
+  background: #f59e0b12;
+  color: #fbbf24;
+  font-size: 9px;
+  line-height: 1.2;
+}
+
+.multi-hw-keys {
+  display: flex;
+  gap: 2px;
+  margin-left: 4px;
+}
+
+.hw-key-btn {
+  padding: 2px 5px;
+  background: var(--bg-deep);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-3);
+  font-size: 10px;
+  cursor: pointer;
+  transition: border-color 0.12s;
+}
+.hw-key-btn:hover { border-color: var(--accent); }
+
+.multi-stream-btns {
+  margin-left: auto;
+  display: flex;
+  gap: 3px;
+  align-items: center;
+}
+
+.multi-mode-badge {
+  font-size: 8px;
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+
+/* Stream area */
+.multi-stream-area {
+  position: relative;
+  flex: 4;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #070b10;
+  min-height: 0;
+  overflow: hidden;
+  position: relative;
+}
+
+.multi-stream-media {
+  max-height: 100%;
+  max-width: 100%;
+  object-fit: contain;
+  cursor: crosshair;
+  touch-action: none;
+  user-select: none;
+}
+
+.multi-stream-placeholder {
+  color: #334155;
+  font-size: 11px;
+}
+
+/* Per-device logs */
+.multi-logs-area {
+  flex: 1;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  background: #050a0f;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.multi-logs-header {
+  padding: 3px 8px;
+  font-size: 9px;
+  font-weight: 600;
+  color: #22c55e;
+  border-bottom: 1px solid #0f1a12;
+  flex-shrink: 0;
+  background: #071209;
+}
+
+.multi-logs-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 6px;
+  font-family: 'Courier New', monospace;
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.multi-log-line {
+  padding-left: 6px;
+}
+
+.multi-log-empty {
+  color: #1a3020;
+  font-style: italic;
+}
+
+.multi-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-4);
+  font-size: 12px;
+  padding: 40px 0;
+}
+</style>

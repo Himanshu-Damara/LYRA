@@ -1,0 +1,1372 @@
+"""Agent chat service — manages sessions, runs the agent loop with tool execution.
+
+Supports multiple LLM providers:
+  - claude-code: Free, local, uses `claude` CLI (default)
+  - anthropic: Claude API with native tool_use
+  - openrouter: Any model via OpenRouter
+  - grok: Normal text chat via the Groq OpenAI-compatible API
+  - ollama: Local models
+"""
+
+import json
+import logging
+import os
+import re
+import subprocess
+import time
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+
+from gitd.bots.common.device import is_ios_ref
+from gitd.services.agent_tools import execute_tool, get_screenshot_b64, tool_prompt_list, tools_for_device
+from gitd.services.device_context import get_phone_state, get_screen_tree
+from gitd.services.llm_backoff import backoff_stream, effort_timeout
+
+log = logging.getLogger(__name__)
+
+DEFAULT_SYSTEM = """You are a mobile automation agent with full control over one connected mobile device.
+
+You can see the screen (via screenshots and UI tree), interact with it (tap, swipe, type),
+launch and control apps, navigate browser pages, and execute automation skills.
+
+## Available tools:
+{tool_list}
+
+## How to use tools:
+To call a tool, output a JSON block like this:
+```tool
+{{"tool": "tool_name", "args": {{"param": "value"}}}}
+```
+
+You can call multiple tools in sequence. After each tool call, I'll show you the result.
+
+## Standard App Packages:
+- WhatsApp: "com.whatsapp"
+- Instagram: "com.instagram.android"
+- Gmail: "com.google.android.gm"
+- Chrome: "com.android.chrome"
+- YouTube: "com.google.android.youtube"
+- Maps: "com.google.android.apps.maps"
+- Clock: "com.google.android.deskclock" (or "com.sec.android.app.clockpackage")
+- Settings: "com.android.settings"
+- Calculator: "com.google.android.calculator"
+
+## Standard Workflows:
+
+### WhatsApp - Sending a Message
+Do NOT assume the contact is visible. Use the search flow:
+1. launch_app with package "com.whatsapp"
+2. Call get_screen_tree to find the Search button/input.
+3. Tap on the search button, then type_text with contact name (e.g. "vansh cu").
+4. Call get_screen_tree, tap on the matching contact name in the list.
+5. type_text the message body.
+6. Tap the "Send" button.
+
+### Instagram - Liking the First Post
+1. launch_app with package "com.instagram.android"
+2. Call get_elements and find the current post's clickable element whose text/content description contains "Like" (not "Unlike").
+3. Tap using the zero-based idx returned by get_elements; never use a number from get_screen_tree.
+4. Call get_elements again and verify that the control changed to "Unlike" or shows the liked state.
+
+## Guidelines:
+- Always use get_screen_tree first to understand what's on screen before any tap
+- Call get_elements before tap_element and use its JSON `idx`; get_screen_tree numbers are display-only and must not be passed to tap_element.
+- After actions, verify results with get_screen_tree
+- Use only the tools listed above; unavailable platform-specific tools have been filtered out
+- Keep responses concise"""
+
+ANTHROPIC_SYSTEM = """You are a mobile automation agent with full control over one connected mobile device.
+
+You can see the screen (via screenshots and UI tree), interact with it (tap, swipe, type),
+launch and control apps, navigate browser pages, and execute automation skills.
+
+Guidelines:
+- Always use get_screen_tree first to understand what's on screen before tapping
+- Call get_elements before tap_element and use its JSON `idx`; get_screen_tree numbers are display-only and must not be passed to tap_element.
+- After performing actions, use get_screen_tree to verify the result
+- Use only the tools exposed for the current device platform
+- Keep responses concise — show what you did and the result"""
+
+MAX_TURNS = 24
+
+PROVIDERS = {
+    "claude-code": {"label": "Claude Code (free)", "models": ["sonnet", "opus", "haiku"]},
+    "anthropic": {"label": "Claude API", "models": ["claude-sonnet-4-20250514", "claude-opus-4-20250514"]},
+    "openrouter": {"label": "OpenRouter", "models": ["anthropic/claude-sonnet-4", "google/gemini-2.5-pro"]},
+    "grok": {"label": "Grok chat (Groq API)", "models": ["grok-beta"]},
+    "ollama": {
+        "label": "Ollama (local)",
+        "models": [
+            "qwen3:8b",
+            "llama3.2:3b",
+            "llama3.2:1b",
+            "gemma3:4b",
+            "qwen3:4b",
+            "phi4-mini:3.8b",
+            "mistral:7b",
+        ],
+    },
+    # On-device — runs the model in-process via MediaPipe (.task) or
+    # llama.cpp JNI (.gguf). The Kotlin OnDeviceModelRegistry is the source of
+    # truth for ids; we ship a default subset here and overlay live ids below.
+    "on-device": {
+        "label": "On-device (Gemma)",
+        "models": ["gemma-3-1b-it", "gemma-2-2b-it", "gemma-4-e2b-q4km-gguf"],
+    },
+    # vLLM — full-precision Gemma 4 served from the GPU box,
+    # routed via Mac SSH tunnel + adb reverse so the phone hits it as if it
+    # were on localhost. Same OpenAI-compatible shape as openrouter; we just
+    # point the client at config.vllm_base_url instead.
+    "vllm": {
+        "label": "vLLM (remote GPU)",
+        "models": [
+            "unsloth/gemma-4-E2B-it",
+            "unsloth/gemma-4-E2B-it-bnb-4bit",
+            "unsloth/gemma-4-E4B-it",
+            "unsloth/gemma-4-E4B-it-bnb-4bit",
+        ],
+    },
+}
+
+
+@dataclass
+class ChatMessage:
+    role: str
+    content: str
+    tool_name: str = ""
+    tool_args: dict = field(default_factory=dict)
+    tool_id: str = ""
+    image_b64: str = ""
+
+
+@dataclass
+class ChatSession:
+    id: str
+    device: str
+    provider: str = "claude-code"
+    model: str = "sonnet"
+    messages: list = field(default_factory=list)
+    api_messages: list = field(default_factory=list)
+    created_at: float = field(default_factory=time.time)
+    auto_screenshot: bool = True
+
+
+_sessions: dict[str, ChatSession] = {}
+_active_procs: dict[str, subprocess.Popen] = {}  # session_id -> running subprocess
+_active_device_turns: dict[str, str] = {}  # device -> session_id
+_stop_requested: set[str] = set()
+
+
+def claim_device_turn(device: str, session_id: str) -> bool:
+    """Allow only one live agent turn per phone.
+
+    This protects the phone and the local LLM from duplicate requests caused
+    by multiple browser tabs or repeated clicks while a turn is still running.
+    """
+    active = _active_device_turns.get(device)
+    if active:
+        return False
+    _active_device_turns[device] = session_id
+    return True
+
+
+def release_device_turn(device: str, session_id: str) -> None:
+    if _active_device_turns.get(device) == session_id:
+        _active_device_turns.pop(device, None)
+
+
+def stop_device_turn(device: str) -> str | None:
+    """Stop the task currently controlling a device, regardless of tab/session."""
+    session_id = _active_device_turns.get(device)
+    if session_id:
+        stop_agent(session_id)
+    return session_id
+
+
+def request_stop(session_id: str) -> None:
+    _stop_requested.add(session_id)
+
+
+def stop_requested(session_id: str) -> bool:
+    return session_id in _stop_requested
+
+
+def clear_stop_request(session_id: str) -> None:
+    _stop_requested.discard(session_id)
+
+
+def platform_context(device: str) -> str:
+    if is_ios_ref(device):
+        return (
+            "Target platform: iOS via Appium/WebDriverAgent. Device refs look like ios:<udid>. "
+            "Use iOS bundle ids with launch_app; call search_apps/list_apps if you need to discover a bundle id. "
+            "Use browser tools such as open_url/extract_visible_text/extract_articles/read_news for web tasks, "
+            "and avoid Android-only concepts such as ADB shell, Android intents, Portal overlay, Play Store, "
+            "and Android package-manager commands."
+        )
+    return (
+        "Target platform: Android via ADB/Portal. Device refs are Android serials. "
+        "Android intents, ADB shell, app packages, Portal overlay, notifications, and package search "
+        "may be available when their tools are listed."
+    )
+
+
+def system_prompt_for_device(device: str, base: str = ANTHROPIC_SYSTEM) -> str:
+    return f"{base}\n\n{platform_context(device)}"
+
+
+def openai_tools_for_device(device: str) -> list[dict]:
+    return [
+        {
+            "type": "function",
+            "function": {"name": t["name"], "description": t["description"], "parameters": t["input_schema"]},
+        }
+        for t in tools_for_device(device)
+    ]
+
+
+def stop_agent(session_id: str):
+    """Kill the running agent subprocess AND all its children — THIS session only.
+
+    chat_claude_code launches claude with start_new_session=True, so claude and
+    its node + MCP-tool children share one process group (pgid == the claude
+    pid). Killing that group through the proc handle registered in
+    _active_procs[session_id] is a complete, session-scoped stop: SIGTERM the
+    group, then SIGKILL if it doesn't exit within 2s. A re-exec (execve) keeps
+    the same pgid, so a changed PID doesn't escape this.
+
+    We deliberately do NOT fall back to `pkill -f claude...stream-json`: that
+    pattern matches EVERY claude stream-json process on the box, so stopping
+    session A would reap session B mid-tap. Worse, the router calls stop_agent
+    in the finally of every stream (including non-claude providers that never
+    register a proc), so a normal completion on one session would nuke every
+    other live agent. Multi-session is a headline capability — keep stops
+    isolated to their own process group.
+    """
+    request_stop(session_id)
+    import os as _os
+    import signal as _sig
+
+    proc = _active_procs.pop(session_id, None)
+    if proc is None:
+        # No process for this session (e.g. anthropic/ollama providers, or
+        # already stopped). Nothing to kill — and crucially, no global sweep.
+        return
+    try:
+        pgid = _os.getpgid(proc.pid)
+        _os.killpg(pgid, _sig.SIGTERM)
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            _os.killpg(pgid, _sig.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    except Exception:
+        # pgid lookup failed (proc already reaped) — best-effort plain kill.
+        try:
+            pgid = _os.getpgid(proc.pid)
+            _os.killpg(pgid, _sig.SIGTERM)
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                _os.killpg(pgid, _sig.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    log.info("Stopped agent for session %s", session_id)
+
+
+def create_session(device: str, provider: str = "", model: str = "", system_prompt: str = "") -> ChatSession:
+    sid = str(uuid.uuid4())[:8]
+    clear_stop_request(sid)
+    if not provider:
+        # Honor the configured default (set by `android-agent login`).
+        from gitd.config import settings
+
+        provider = settings.default_provider or "claude-code"
+    default_model = PROVIDERS.get(provider, {}).get("models", ["sonnet"])[0] if not model else model
+    session = ChatSession(id=sid, device=device, provider=provider, model=default_model or "sonnet")
+    _sessions[sid] = session
+    return session
+
+
+def get_session(sid: str) -> ChatSession | None:
+    return _sessions.get(sid)
+
+
+def list_sessions() -> list[dict]:
+    return [
+        {"id": s.id, "device": s.device, "provider": s.provider, "model": s.model, "messages": len(s.messages)}
+        for s in _sessions.values()
+    ]
+
+
+def delete_session(sid: str):
+    _sessions.pop(sid, None)
+    clear_stop_request(sid)
+
+
+# ── Persistence (DB) ───────────────────────────────────────────────────────
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def save_session_to_db(session: ChatSession):
+    """Persist a ChatSession to the database (upsert conversation + append new messages)."""
+    from gitd.models.base import SessionLocal
+    from gitd.models.chat import ChatConversation, ChatMessageRow
+
+    db = SessionLocal()
+    try:
+        conv = db.query(ChatConversation).filter_by(id=session.id).first()
+        now = _utcnow_iso()
+
+        if not conv:
+            # Auto-generate title from first user message
+            title = ""
+            for msg in session.messages:
+                if msg.role == "user" and msg.content:
+                    title = msg.content[:50]
+                    break
+            conv = ChatConversation(
+                id=session.id,
+                device=session.device,
+                provider=session.provider,
+                model=session.model,
+                title=title,
+                created_at=now,
+                updated_at=now,
+                message_count=0,
+            )
+            db.add(conv)
+
+        conv.updated_at = now
+        conv.message_count = len(session.messages)
+
+        # Only insert messages that haven't been saved yet
+        existing_count = db.query(ChatMessageRow).filter_by(conversation_id=session.id).count()
+        for msg in session.messages[existing_count:]:
+            db.add(
+                ChatMessageRow(
+                    conversation_id=session.id,
+                    role=msg.role,
+                    content=msg.content or "",
+                    tool_name=msg.tool_name or "",
+                    tool_args=json.dumps(msg.tool_args) if msg.tool_args else "{}",
+                    tool_id=msg.tool_id or "",
+                    created_at=now,
+                )
+            )
+
+        db.commit()
+    except Exception:
+        db.rollback()
+        log.exception("Failed to save session %s to DB", session.id)
+    finally:
+        db.close()
+
+
+def list_conversations(device: str | None = None) -> list[dict]:
+    """Return saved conversations, newest first."""
+    from gitd.models.base import SessionLocal
+    from gitd.models.chat import ChatConversation
+
+    db = SessionLocal()
+    try:
+        q = db.query(ChatConversation)
+        if device:
+            q = q.filter_by(device=device)
+        rows = q.order_by(ChatConversation.updated_at.desc()).all()
+        return [
+            {
+                "id": r.id,
+                "device": r.device,
+                "provider": r.provider,
+                "model": r.model,
+                "title": r.title,
+                "created_at": r.created_at,
+                "updated_at": r.updated_at,
+                "message_count": r.message_count,
+            }
+            for r in rows
+        ]
+    finally:
+        db.close()
+
+
+def load_conversation(conversation_id: str) -> ChatSession | None:
+    """Load a conversation from DB into an active ChatSession (placed in _sessions)."""
+    from gitd.models.base import SessionLocal
+    from gitd.models.chat import ChatConversation, ChatMessageRow
+
+    db = SessionLocal()
+    try:
+        conv = db.query(ChatConversation).filter_by(id=conversation_id).first()
+        if not conv:
+            return None
+
+        rows = db.query(ChatMessageRow).filter_by(conversation_id=conversation_id).order_by(ChatMessageRow.id).all()
+
+        messages = []
+        api_messages = []
+        for r in rows:
+            tool_args = {}
+            if r.tool_args and r.tool_args != "{}":
+                try:
+                    tool_args = json.loads(r.tool_args)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            messages.append(
+                ChatMessage(
+                    role=r.role,
+                    content=r.content or "",
+                    tool_name=r.tool_name or "",
+                    tool_args=tool_args,
+                    tool_id=r.tool_id or "",
+                    image_b64="",
+                )
+            )
+
+            # Rebuild api_messages for anthropic provider
+            if conv.provider == "anthropic":
+                if r.role == "user":
+                    api_messages.append({"role": "user", "content": r.content or ""})
+                elif r.role == "assistant":
+                    api_messages.append({"role": "assistant", "content": r.content or ""})
+                # tool_call and tool_result are harder to reconstruct exactly,
+                # so for anthropic the resumed session may lose tool history.
+                # Claude-code is stateless per turn so this is fine.
+
+        session = ChatSession(
+            id=conv.id,
+            device=conv.device,
+            provider=conv.provider,
+            model=conv.model,
+            messages=messages,
+            api_messages=api_messages,
+        )
+        _sessions[conv.id] = session
+        clear_stop_request(conv.id)
+        return session
+    finally:
+        db.close()
+
+
+def delete_conversation(conversation_id: str):
+    """Delete a conversation and its messages from the database."""
+    from gitd.models.base import SessionLocal
+    from gitd.models.chat import ChatConversation, ChatMessageRow
+
+    db = SessionLocal()
+    try:
+        db.query(ChatMessageRow).filter_by(conversation_id=conversation_id).delete()
+        db.query(ChatConversation).filter_by(id=conversation_id).delete()
+        db.commit()
+    except Exception:
+        db.rollback()
+        log.exception("Failed to delete conversation %s", conversation_id)
+    finally:
+        db.close()
+    # Also remove from in-memory sessions if present
+    _sessions.pop(conversation_id, None)
+
+
+def get_providers() -> list[dict]:
+    """Return providers with models. Ollama models are discovered live from the local server."""
+    import requests
+
+    result = []
+    for pid, info in PROVIDERS.items():
+        models = list(info["models"])
+        if pid == "grok":
+            from gitd.config import settings
+
+            configured_model = os.environ.get("GROK_MODEL") or settings.grok_model
+            if configured_model:
+                models = [configured_model]
+        if pid == "ollama":
+            try:
+                r = requests.get("http://localhost:11434/api/tags", timeout=3)
+                installed = [m["name"] for m in r.json().get("models", [])]
+                if installed:
+                    models = installed
+            except Exception:
+                pass  # Ollama not running — return defaults
+        result.append({"id": pid, "label": info["label"], "models": models})
+    return result
+
+
+def chat_turn(session: ChatSession, user_message: str):
+    """Run one agent turn. Yields SSE event dicts."""
+    # WhatsApp contact selection must be deterministic. Text-only models can
+    # otherwise tap the first visible chat instead of using WhatsApp search.
+    whatsapp_request = _parse_whatsapp_send_request(user_message)
+    if whatsapp_request:
+        yield from _run_whatsapp_send(session, *whatsapp_request)
+        return
+
+    provider = session.provider
+    if provider == "anthropic":
+        yield from _chat_anthropic(session, user_message)
+    elif provider == "claude-code":
+        from gitd.services.agent_chat_claude_code import chat_claude_code
+
+        yield from chat_claude_code(session, user_message)
+    elif provider == "openrouter":
+        yield from _chat_openrouter(session, user_message)
+    elif provider == "grok":
+        yield from _chat_grok(session, user_message)
+    elif provider == "vllm":
+        yield from _chat_vllm(session, user_message)
+    elif provider == "ollama":
+        yield from _chat_ollama(session, user_message)
+    elif provider == "on-device":
+        from gitd.services.agent_chat_ondevice import chat_ondevice
+
+        yield from chat_ondevice(session, user_message)
+    else:
+        yield {"type": "error", "content": f"Unknown provider: {provider}"}
+
+
+def _parse_whatsapp_send_request(user_message: str) -> tuple[str, str] | None:
+    """Extract a quoted message and contact from a WhatsApp send request."""
+    text = (user_message or "").strip()
+    if not re.search(r"\bwhatsapp\b", text, re.IGNORECASE) or not re.search(r"\bsend\b", text, re.IGNORECASE):
+        return None
+
+    message_match = re.search(r"['\"]([^'\"]+)['\"]", text)
+    if not message_match:
+        return None
+    contact_match = re.search(r"\bto\s+(.+?)\s*$", text, re.IGNORECASE)
+    if not contact_match:
+        return None
+    contact = contact_match.group(1).strip(" .,!?")
+    message = message_match.group(1).strip()
+    return (contact, message) if contact and message else None
+
+
+def _run_whatsapp_send(session: ChatSession, contact: str, message: str):
+    """Run the deterministic WhatsApp search/send workflow."""
+    args = {
+        "device": session.device,
+        "skill": "whatsapp",
+        "workflow": "send_message",
+        "params": {"contact": contact, "message": message},
+    }
+    yield {"type": "activity", "content": f"📱 Searching WhatsApp for {contact}..."}
+    yield {"type": "tool_call", "name": "whatsapp.send_message", "args": {"contact": contact, "message": message}}
+    result = execute_tool("run_skill", args)
+    yield {"type": "tool_result", "name": "whatsapp.send_message", "result": result[:1200]}
+    if "success" in result.lower() or '"ok": true' in result.lower() or '"sent": true' in result.lower():
+        reply = f'Sent "{message}" to {contact} on WhatsApp.'
+        session.messages.append(ChatMessage(role="assistant", content=reply))
+        yield {"type": "text", "content": reply}
+    else:
+        error = f"WhatsApp send failed for {contact}: {result[:500]}"
+        session.messages.append(ChatMessage(role="assistant", content=error))
+        yield {"type": "error", "content": error}
+    yield {"type": "done"}
+
+
+# ── Session-scoped meta tools (chat → skill) ─────────────────────────────────
+
+_META_TOOLS = {"draft_skill", "save_skill"}
+
+
+def maybe_handle_meta_tool(session: ChatSession, name: str, args: dict) -> str | None:
+    """Handle conversation-level meta tools (draft_skill / save_skill).
+
+    These operate on the whole session (not the device UI), so they run here —
+    where `session` is in scope — instead of the stateless execute_tool. Returns
+    the result string, or None for a normal device tool so the caller falls back
+    to execute_tool. The session is flushed to the DB first so the distiller
+    reads a complete, ordered action trace.
+    """
+    if name not in _META_TOOLS:
+        return None
+    import json as _json
+
+    try:
+        save_session_to_db(session)
+    except Exception:
+        log.exception("meta-tool %s: failed to flush session %s", name, session.id)
+    try:
+        if name == "draft_skill":
+            from gitd.services.skills_from_chat import draft_hard_skill
+
+            return _json.dumps(draft_hard_skill(session.id), indent=2)
+        # save_skill
+        from gitd.services.skills_from_chat import commit_skill
+
+        res = commit_skill(
+            kind=args.get("kind", "hard"),
+            name=(args.get("name") or "").strip().lower().replace(" ", "_"),
+            app_package=args.get("app_package", ""),
+            description=args.get("description", ""),
+            steps=args.get("steps"),
+            guidance=args.get("guidance"),
+            conversation_id=session.id,
+        )
+        return _json.dumps(res, indent=2)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def _dispatch_tool(session: ChatSession, name: str, args: dict) -> str:
+    """Dispatch a tool call: session-scoped meta tools first, else device tools."""
+    if stop_requested(session.id):
+        return "Stopped by user before this action started."
+    result = maybe_handle_meta_tool(session, name, args)
+    if result is not None:
+        return result
+
+    # Text-only models sometimes emit the schema placeholder ("device") or
+    # omit the device argument entirely. Never let that redirect a tool call
+    # to a nonexistent/incorrect phone: the chat session is authoritative.
+    tool_args = dict(args or {})
+    if name != "list_devices":
+        tool_args["device"] = session.device
+    # Small local models frequently serialize JSON-schema integer fields as
+    # strings. Normalize coordinate/index fields before the typed tool code
+    # compares or passes them to ADB.
+    for key in ("idx", "x", "y", "x1", "y1", "x2", "y2", "duration_ms", "timer_s"):
+        value = tool_args.get(key)
+        if isinstance(value, str):
+            try:
+                tool_args[key] = int(value)
+            except ValueError:
+                pass
+    return execute_tool(name, tool_args)
+
+
+# ── Anthropic API (native tool_use) ──────────────────────────────────────────
+
+
+def _chat_anthropic(session: ChatSession, user_message: str):
+    """Use Anthropic API with native tool calling."""
+    import anthropic
+
+    session.messages.append(ChatMessage(role="user", content=user_message))
+    session.api_messages.append({"role": "user", "content": _build_vision_content(session, user_message)})
+
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+    available_tools = tools_for_device(session.device)
+
+    for turn in range(MAX_TURNS):
+        try:
+            resp = None
+            for ev in backoff_stream(
+                lambda: client.messages.create(
+                    model=session.model,
+                    max_tokens=4096,
+                    system=system_prompt_for_device(session.device),
+                    messages=session.api_messages,
+                    tools=available_tools,
+                    timeout=effort_timeout(session.model),
+                )
+            ):
+                if "__result__" in ev:
+                    resp = ev["__result__"]
+                else:
+                    yield ev
+        except Exception as e:
+            yield {"type": "error", "content": str(e)}
+            return
+
+        has_tool_use = False
+        tool_results = []
+
+        for block in resp.content:
+            if block.type == "text":
+                session.messages.append(ChatMessage(role="assistant", content=block.text))
+                yield {"type": "text", "content": block.text}
+            elif block.type == "tool_use":
+                has_tool_use = True
+                tool_name = block.name
+                tool_args = dict(block.input)
+                tool_args.setdefault("device", session.device)
+
+                session.messages.append(
+                    ChatMessage(
+                        role="tool_call", tool_name=tool_name, tool_args=tool_args, tool_id=block.id, content=""
+                    )
+                )
+                yield {"type": "tool_call", "name": tool_name, "args": tool_args}
+
+                # Catch tool failures (e.g. ADBError on an offline/unauthorized
+                # device) so they become a tool_result the model can react to,
+                # not an uncaught raise that breaks the SSE stream. Every
+                # tool_use MUST get a matching tool_result or the next turn's
+                # Anthropic request is malformed — so the error text flows into
+                # the same result path below. Mirrors the vllm/ollama loops.
+                try:
+                    result = _dispatch_tool(session, tool_name, tool_args)
+                except Exception as e:
+                    result = f"Tool error: {e}"
+                image_b64 = ""
+                if tool_name in ("screenshot", "screenshot_annotated", "screenshot_cropped"):
+                    image_b64 = get_screenshot_b64(tool_args.get("device", session.device)) or ""
+
+                session.messages.append(
+                    ChatMessage(
+                        role="tool_result", content=result, tool_name=tool_name, tool_id=block.id, image_b64=image_b64
+                    )
+                )
+                yield {"type": "tool_result", "name": tool_name, "result": result[:500]}
+                if image_b64:
+                    yield {"type": "screenshot", "image": image_b64}
+
+                tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result[:5000]})
+
+        session.api_messages.append({"role": "assistant", "content": resp.content})
+        if has_tool_use:
+            session.api_messages.append({"role": "user", "content": tool_results})
+        else:
+            break
+
+    yield {"type": "done"}
+
+
+# ── OpenRouter ───────────────────────────────────────────────────────────────
+
+
+def _chat_openrouter(session: ChatSession, user_message: str):
+    """Use OpenRouter with OpenAI-compatible tool calling.
+
+    Multi-turn agent loop (same shape as _chat_vllm): feed each tool result
+    back to the model until it answers without tool calls or MAX_TURNS.
+    """
+    from openai import OpenAI
+
+    from gitd.config import settings
+
+    session.messages.append(ChatMessage(role="user", content=user_message))
+
+    client = OpenAI(
+        api_key=os.environ.get("OPENROUTER_API_KEY", settings.openrouter_api_key or ""),
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    oai_tools = openai_tools_for_device(session.device)
+
+    context = ""
+    try:
+        tree = get_screen_tree(session.device)
+        state = get_phone_state(session.device)
+        context = f"[Screen]\n{tree[:1500]}\n[App: {state.get('currentApp', '?')}]\n\n"
+    except Exception:
+        pass
+
+    messages: list[dict] = [
+        {"role": "system", "content": system_prompt_for_device(session.device)},
+        {"role": "user", "content": f"{context}Device: {session.device}\n\n{user_message}"},
+    ]
+
+    model = session.model or "anthropic/claude-sonnet-4"
+
+    for _turn in range(MAX_TURNS):
+        try:
+            resp = None
+            for ev in backoff_stream(
+                lambda: client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    tools=oai_tools,
+                    max_tokens=4096,
+                    timeout=effort_timeout(model),
+                )
+            ):
+                if "__result__" in ev:
+                    resp = ev["__result__"]
+                else:
+                    yield ev
+        except Exception as e:
+            yield {"type": "error", "content": str(e)}
+            yield {"type": "done"}
+            return
+
+        msg = resp.choices[0].message
+
+        if msg.content:
+            session.messages.append(ChatMessage(role="assistant", content=msg.content))
+            yield {"type": "text", "content": msg.content}
+
+        tool_calls = getattr(msg, "tool_calls", None) or []
+        if not tool_calls:
+            break
+
+        messages.append(
+            {
+                "role": "assistant",
+                "content": msg.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                    }
+                    for tc in tool_calls
+                ],
+            }
+        )
+
+        for tc in tool_calls:
+            tool_name = tc.function.name
+            try:
+                tool_args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+            except json.JSONDecodeError:
+                tool_args = {}
+            tool_args.setdefault("device", session.device)
+
+            session.messages.append(ChatMessage(role="tool_call", tool_name=tool_name, tool_args=tool_args, content=""))
+            yield {"type": "tool_call", "name": tool_name, "args": tool_args}
+
+            try:
+                result = _dispatch_tool(session, tool_name, tool_args)
+            except Exception as e:
+                result = f"Tool error: {e}"
+            session.messages.append(ChatMessage(role="tool_result", content=result[:500], tool_name=tool_name))
+            yield {"type": "tool_result", "name": tool_name, "result": result[:500]}
+
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "name": tool_name,
+                    "content": result[:1500],
+                }
+            )
+
+    yield {"type": "done"}
+
+
+def _chat_grok(session: ChatSession, user_message: str):
+    """Run a normal text-only chat turn through xAI's Grok API.
+
+    Grok is intentionally kept separate from the mobile-agent tool loop: when
+    the user selects it for normal chat, it must answer conversationally and
+    must not launch apps or tap the connected phone.
+    """
+    from openai import OpenAI
+
+    from gitd.config import settings
+
+    api_key = (
+        os.environ.get("GROK_API_KEY")
+        or os.environ.get("GROQ_API_KEY")
+        or settings.grok_api_key
+    )
+    if not api_key:
+        yield {"type": "error", "content": "Grok chat is not configured. Add GROK_API_KEY to .env and restart the server."}
+        yield {"type": "done"}
+        return
+
+    session.messages.append(ChatMessage(role="user", content=user_message))
+    messages: list[dict] = [
+        {
+            "role": "system",
+            "content": "You are LYRA's normal chat assistant. Answer clearly and helpfully. Do not control or operate the connected phone.",
+        }
+    ]
+    for item in session.messages:
+        if item.role in {"user", "assistant"} and item.content:
+            messages.append({"role": item.role, "content": item.content})
+
+    try:
+        client = OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
+        # A session can retain a model from Ollama/Claude after the provider
+        # is switched. Groq must use its configured model instead of sending
+        # values such as ``sonnet`` to the Groq endpoint.
+        model = os.environ.get("GROK_MODEL") or settings.grok_model
+        resp = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_tokens=2048,
+            timeout=120,
+        )
+        content = (resp.choices[0].message.content or "").strip()
+        if content:
+            session.messages.append(ChatMessage(role="assistant", content=content))
+            yield {"type": "text", "content": content}
+    except Exception as e:
+        log.exception("Grok chat request failed")
+        yield {"type": "error", "content": str(e)}
+    yield {"type": "done"}
+
+
+# ── vLLM (OpenAI-compatible, remote GPU via SSH) ──────────────────────────────
+
+
+def _chat_vllm(session: ChatSession, user_message: str):
+    """Use a vLLM server (default: remote GPU via SSH tunnel + adb reverse) with
+    OpenAI-compatible tool calling and multi-turn agent loop.
+
+    Same OpenAI surface as _chat_openrouter, but unlike that one we DO loop on
+    tool results — the whole point of routing to a real GPU is to put a smarter
+    model into the actual agent loop (open Settings → tap Wi-Fi → ...), not
+    just emit a single round of tool calls.
+    """
+    from openai import OpenAI
+
+    from gitd.config import settings
+
+    session.messages.append(ChatMessage(role="user", content=user_message))
+
+    client = OpenAI(
+        api_key=os.environ.get("GITD_VLLM_API_KEY", settings.vllm_api_key) or "EMPTY",
+        base_url=os.environ.get("GITD_VLLM_BASE_URL", settings.vllm_base_url),
+    )
+
+    oai_tools = openai_tools_for_device(session.device)
+
+    # Initial screen context.
+    context = ""
+    try:
+        tree = get_screen_tree(session.device)
+        state = get_phone_state(session.device)
+        context = f"[Screen]\n{tree[:1500]}\n[App: {state.get('currentApp', '?')}]\n\n"
+    except Exception:
+        pass
+
+    messages: list[dict] = [
+        {"role": "system", "content": system_prompt_for_device(session.device)},
+        {"role": "user", "content": f"{context}Device: {session.device}\n\n{user_message}"},
+    ]
+
+    model = session.model or "unsloth/gemma-4-E4B-it"
+
+    for turn in range(MAX_TURNS):
+        yield {"type": "activity", "content": f"🧠 Inferring (turn {turn + 1})..."}
+
+        try:
+            resp = None
+            for ev in backoff_stream(
+                lambda: client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    tools=oai_tools,
+                    max_tokens=2048,
+                    timeout=effort_timeout(model),
+                )
+            ):
+                if "__result__" in ev:
+                    resp = ev["__result__"]
+                else:
+                    yield ev
+        except Exception as e:
+            yield {
+                "type": "error",
+                "content": (
+                    f"vLLM unreachable at {client.base_url}. "
+                    f"Start the server on your GPU host and ensure the SSH tunnel + "
+                    f"`adb reverse tcp:8000 tcp:8000` are up. ({e})"
+                ),
+            }
+            yield {"type": "done"}
+            return
+
+        msg = resp.choices[0].message
+
+        if msg.content:
+            session.messages.append(ChatMessage(role="assistant", content=msg.content))
+            yield {"type": "text", "content": msg.content}
+
+        # OpenAI-shape tool_calls. If absent, the model is done.
+        tool_calls = getattr(msg, "tool_calls", None) or []
+        if not tool_calls:
+            break
+
+        # Append the assistant turn to the rolling conversation BEFORE running
+        # tools so the next request sees the assistant's tool_calls in
+        # context (OpenAI shape requires this).
+        messages.append(
+            {
+                "role": "assistant",
+                "content": msg.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                    }
+                    for tc in tool_calls
+                ],
+            }
+        )
+
+        for tc in tool_calls:
+            tool_name = tc.function.name
+            try:
+                tool_args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+            except json.JSONDecodeError:
+                tool_args = {}
+            tool_args.setdefault("device", session.device)
+
+            session.messages.append(ChatMessage(role="tool_call", tool_name=tool_name, tool_args=tool_args, content=""))
+            yield {"type": "tool_call", "name": tool_name, "args": tool_args}
+
+            try:
+                result = _dispatch_tool(session, tool_name, tool_args)
+            except Exception as e:
+                result = f"Tool error: {e}"
+            session.messages.append(ChatMessage(role="tool_result", content=result[:500], tool_name=tool_name))
+            yield {"type": "tool_result", "name": tool_name, "result": result[:500]}
+
+            # Feed result back to the model for the next turn.
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "name": tool_name,
+                    "content": result[:1500],
+                }
+            )
+
+    yield {"type": "done"}
+
+
+# ── Tool-call parsing + Ollama ────────────────────────────────────────────────
+
+
+def _parse_tool_calls(text: str) -> list[dict]:
+    """Extract tool calls from LLM output.
+
+    Handles a fair amount of slop because small models — especially raw Gemma 4 —
+    emit f-string-style doubled braces, half-quoted keys, trailing ``, " "``
+    junk, missing/extra closing braces, and similar near-misses.
+
+    Accepted shapes:
+      - {"tool": "X", "args": {...}}           (canonical)
+      - {"tool": "X", "kwarg1": ..., ...}      (flat — e.g. ghost-gemma trained)
+      - {"action_type": "X", ...}              (action-schema — translated to tool)
+    """
+    import re
+
+    if not text:
+        return []
+
+    calls: list[dict] = []
+
+    # Map from action-schema "action_type" → ("tool", arg-key-rewrites). For raw
+    # Gemma 4 emitting the action schema we trained on, this lets the dispatcher
+    # see canonical tool calls without retraining the parser side.
+    action_to_tool = {
+        "open_app": ("launch_app", {"app_name": "package"}),
+        "click": ("tap", {"x": "x", "y": "y"}),
+        "tap": ("tap", {}),
+        "long_press": ("long_press", {}),
+        "type_text": ("input_text", {"text": "text"}),
+        "input_text": ("input_text", {}),
+        "swipe": ("swipe", {}),
+        "key_event": ("key_event", {"key": "key"}),
+        "screenshot": ("screenshot", {}),
+        "wait": ("wait", {"duration_ms": "ms"}),
+        "force_stop": ("force_stop", {}),
+    }
+
+    def _coerce_action(d: dict) -> dict | None:
+        action = d.get("action_type")
+        if not isinstance(action, str):
+            return None
+        mapping = action_to_tool.get(action)
+        if not mapping:
+            return None
+        tool_name, key_map = mapping
+        args = {}
+        for k, v in d.items():
+            if k == "action_type":
+                continue
+            args[key_map.get(k, k)] = v
+        return {"tool": tool_name, "args": args}
+
+    def _try_dict(d: object) -> bool:
+        if not isinstance(d, dict):
+            return False
+        if "tool" in d:
+            calls.append(d)
+            return True
+        coerced = _coerce_action(d)
+        if coerced:
+            calls.append(coerced)
+            return True
+        return False
+
+    def _try_loads(raw: str) -> bool:
+        try:
+            return _try_dict(json.loads(raw))
+        except (ValueError, TypeError):
+            return False
+
+    def _attempt_repairs(raw: str) -> bool:
+        """Run a chain of cleanups, retrying json.loads at every checkpoint."""
+        candidate = raw
+
+        # Doubled braces (Gemma f-string artefact) → singles. Only run when at
+        # least one ``{{`` is present — otherwise we'd corrupt valid JSON like
+        # ``{"a":{"b":1}}`` which has trailing ``}}`` for nested closes.
+        # Do it ONCE only; iterating collapses legitimate triples like ``}}}``
+        # (which is ``}}`` + ``}`` in the doubled convention) past the right
+        # shape.
+        if "{{" in candidate:
+            new = candidate.replace("{{", "{").replace("}}", "}")
+            if new != candidate:
+                candidate = new
+                if _try_loads(candidate):
+                    return True
+
+        # Strip dangling-comma "junk pairs" like ``, " "`` or ``, ""`` that some
+        # models tack on before a closing brace.
+        cleaned = re.sub(r',\s*"[^"]*"\s*(?=[,}])', "", candidate)
+        if cleaned != candidate:
+            candidate = cleaned
+            if _try_loads(candidate):
+                return True
+
+        # Drop trailing ``,`` before ``}`` / ``]``.
+        cleaned = re.sub(r",\s*([}\]])", r"\1", candidate)
+        if cleaned != candidate:
+            candidate = cleaned
+            if _try_loads(candidate):
+                return True
+
+        # Truncate to the first balanced brace span — handles trailing prose
+        # or extra closing braces.
+        depth = 0
+        start = candidate.find("{")
+        if start >= 0:
+            for i in range(start, len(candidate)):
+                ch = candidate[i]
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        if _try_loads(candidate[start : i + 1]):
+                            return True
+                        break
+
+        return False
+
+    # 1) ```tool / ```json fenced blocks (prompt asks for these)
+    for match in re.finditer(r"```(?:tool|json)?\s*\n?(.*?)\n?```", text, re.DOTALL):
+        raw = match.group(1).strip()
+        if not raw:
+            continue
+        if _try_loads(raw):
+            continue
+        _attempt_repairs(raw)
+
+    if calls:
+        return calls
+
+    # 2) No fences — scan for inline JSON objects mentioning "tool" or
+    #    "action_type". Greedy: match every {...} and try each.
+    for match in re.finditer(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", text, re.DOTALL):
+        raw = match.group(0)
+        if '"tool"' not in raw and '"action_type"' not in raw:
+            continue
+        if _try_loads(raw):
+            continue
+        _attempt_repairs(raw)
+
+    if calls:
+        return calls
+
+    # 3) Last-ditch fallback — Gemma at temp 0 routinely emits inline doubled
+    #    braces with a mismatched count of closing `}` (e.g. five `}` for two
+    #    `{{`). The step-2 regex above can't match a `{{` start because it
+    #    expects a non-brace character after the first `{`. Collapse doubled
+    #    braces over the whole text and try the same scan again.
+    if "{{" in text or "}}" in text:
+        flattened = text.replace("{{", "{").replace("}}", "}")
+        for match in re.finditer(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", flattened, re.DOTALL):
+            raw = match.group(0)
+            if '"tool"' not in raw and '"action_type"' not in raw:
+                continue
+            if _try_loads(raw):
+                continue
+            _attempt_repairs(raw)
+
+    return calls
+
+
+def normalize_tool_call(call: dict) -> tuple[str, dict]:
+    """Split a parsed tool call into ``(tool_name, args)``.
+
+    Two shapes are seen in the wild and every provider must accept both:
+      - ``{"tool": "X", "args": {...}}``          (gemma-4-e2b, llama, canonical)
+      - ``{"tool": "X", "package": "...", ...}``   (ghost-gemma trained, qwen — flat)
+
+    Prefer the nested ``args`` dict; otherwise treat the rest of the dict
+    (every key except ``tool``) as kwargs. Returns a fresh dict the caller
+    can mutate (e.g. ``setdefault("device", ...)``) without touching ``call``.
+    """
+    tool_name = call.get("tool", "")
+    raw_args = call.get("args")
+    if isinstance(raw_args, dict):
+        args = dict(raw_args)
+    else:
+        args = {k: v for k, v in call.items() if k != "tool"}
+    return tool_name, args
+
+
+def _chat_ollama(session: ChatSession, user_message: str):
+    """Use local Ollama model with multi-turn tool execution loop."""
+    import requests
+
+    session.messages.append(ChatMessage(role="user", content=user_message))
+    if stop_requested(session.id):
+        yield {"type": "done"}
+        return
+    yield {"type": "activity", "content": "📱 Reading screen..."}
+
+    # Build screen context
+    context = ""
+    try:
+        tree = get_screen_tree(session.device)
+        state = get_phone_state(session.device)
+        context = f"[Screen]\n{tree[:1500]}\n[App: {state.get('currentApp', '?')}]\n\n"
+    except Exception as exc:
+        # A screen read should not prevent Ollama from responding. The model
+        # can still launch an app or report that the device is unavailable.
+        yield {"type": "activity", "content": f"⚠️ Screen read unavailable; continuing ({str(exc)[:100]})"}
+
+    if stop_requested(session.id):
+        yield {"type": "done"}
+        return
+
+    # Build tool list with param names so the LLM knows what args to send
+    system = DEFAULT_SYSTEM.replace("{tool_list}", tool_prompt_list(tools_for_device(session.device)))
+    system = system_prompt_for_device(session.device, system)
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": f"{context}Device: {session.device}\n\n{user_message}"},
+    ]
+
+    model = session.model or "llama3.2:3b"
+
+    # Gemma 4 (and other reasoning models) emit chain-of-thought into a
+    # separate `thinking` field. The agent loop wants direct JSON tool calls,
+    # so disable thinking for the action loop. Surface any thinking that does
+    # arrive as a `thinking` event so the UI can show it.
+    is_thinking_model = any(t in model.lower() for t in ("gemma-4", "gemma4", "ghost-gemma", "qwen3", "deepseek-r1"))
+
+    for turn in range(MAX_TURNS):
+        if stop_requested(session.id):
+            yield {"type": "activity", "content": "Stopped by user"}
+            return
+        try:
+            payload = {
+                "model": model,
+                "messages": messages,
+                "stream": False,
+                "options": {"num_ctx": 4096, "num_predict": 512},
+            }
+            if is_thinking_model:
+                payload["think"] = False
+            r = requests.post(
+                "http://localhost:11434/api/chat",
+                json=payload,
+                timeout=120,
+            )
+            data = r.json()
+            if r.status_code != 200:
+                error = data.get("error", r.text[:200])
+                if "not found" in error.lower():
+                    yield {
+                        "type": "error",
+                        "content": f"Model '{model}' not found. Pull it first: ollama pull {model}",
+                    }
+                else:
+                    yield {"type": "error", "content": f"Ollama error: {error}"}
+                return
+            msg = data.get("message", {}) or {}
+            reply = msg.get("content", "") or ""
+            thinking = msg.get("thinking", "") or ""
+            if thinking:
+                yield {"type": "thinking", "content": thinking}
+            # Fallback: if think:false was ignored and content is empty but thinking has the answer
+            if not reply and thinking:
+                reply = thinking
+        except requests.ConnectionError:
+            yield {
+                "type": "error",
+                "content": "Ollama not reachable at localhost:11434. Start it: ollama serve",
+            }
+            return
+        except Exception as e:
+            yield {"type": "error", "content": str(e)}
+            return
+
+        if not reply:
+            break
+
+        session.messages.append(ChatMessage(role="assistant", content=reply))
+        yield {"type": "text", "content": reply}
+        messages.append({"role": "assistant", "content": reply})
+
+        # Parse and execute tool calls
+        tool_calls = _parse_tool_calls(reply)
+        if not tool_calls:
+            break  # No tools requested — done
+
+        tool_results = []
+        for call in tool_calls:
+            if stop_requested(session.id):
+                yield {"type": "activity", "content": "Stopped by user"}
+                return
+            tool_name, tool_args = normalize_tool_call(call)
+            tool_args.setdefault("device", session.device)
+
+            session.messages.append(ChatMessage(role="tool_call", tool_name=tool_name, tool_args=tool_args, content=""))
+            yield {"type": "tool_call", "name": tool_name, "args": tool_args}
+
+            try:
+                result = _dispatch_tool(session, tool_name, tool_args)
+                session.messages.append(ChatMessage(role="tool_result", content=result[:500], tool_name=tool_name))
+                yield {"type": "tool_result", "name": tool_name, "result": result[:500]}
+                tool_results.append(f"[{tool_name}] {result[:800]}")
+            except Exception as e:
+                err = f"Tool error: {e}"
+                session.messages.append(ChatMessage(role="tool_result", content=err, tool_name=tool_name))
+                yield {"type": "tool_result", "name": tool_name, "result": err}
+                tool_results.append(f"[{tool_name}] ERROR: {err}")
+
+        # Feed tool results back for next turn
+        messages.append({"role": "user", "content": "Tool results:\n" + "\n".join(tool_results)})
+
+    yield {"type": "done"}
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _build_vision_content(session: ChatSession, text: str) -> list:
+    """Build user content with screenshot for vision-capable providers."""
+    content = []
+    if session.auto_screenshot and session.device:
+        try:
+            tree = get_screen_tree(session.device)
+            if tree and tree != "(empty screen)":
+                content.append({"type": "text", "text": f"[Current screen]\n{tree[:2000]}"})
+        except Exception:
+            pass
+        try:
+            state = get_phone_state(session.device)
+            if state:
+                content.append(
+                    {"type": "text", "text": f"[App: {state.get('currentApp', '')} ({state.get('packageName', '')})]"}
+                )
+        except Exception:
+            pass
+        try:
+            img = get_screenshot_b64(session.device)
+            if img:
+                content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img}})
+        except Exception:
+            pass
+    content.append({"type": "text", "text": text})
+    return content
