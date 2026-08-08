@@ -1,0 +1,26 @@
+name: whatsapp
+description: Send a WhatsApp message to a saved contact on Android
+version: "1.0.0"
+app_package: com.whatsapp
+android_package: com.whatsapp
+platforms:
+  - android
+exports:
+  actions:
+    - search_contact
+    - type_message
+    - send_message
+  workflows:
+    - send_message
+default_params:
+  workflows:
+    send_message:
+      contact: ""
+      message: ""
+popup_detectors:
+  - detect: "Allow"
+    button: "Allow"
+    label: "WhatsApp permission dialog"
+  - detect: "While using the app"
+    button: "While using the app"
+    label: "WhatsApp permission dialog"
